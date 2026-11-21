@@ -186,6 +186,7 @@ static double tilt_error(void) { return fabs(tilt_of(last_state()) - truth_tilt(
 #define MAX_YAW_ERR  4.0   /* deg: gyro bias over the scenario plus the tracker's own fuzz filter */
 #define MAX_TILT_ERR 5.0
 #define MAX_STEP     3.0   /* deg between two consecutive states */
+#define MAX_START_TILT_ERR 8.0   /* the tracker's first 30 samples (beta 20) ring by about 6 deg; its fuzz filter then holds it */
 
 static void check_settled(Ref r, size_t mark, const char *what)
 {
@@ -267,6 +268,69 @@ static void units(bool hid)
 static void units_evdev(void) { units(false); }
 static void units_hidraw(void) { units(true); }
 
+static void mic_rest(void)
+{
+    begin(DEV_START);
+    start();
+    rest(1);
+    size_t mark = mock_nstates();
+    Ref r = ref_now();
+    check(input_mic_set_state(ctx, true, false), "mic stream on");
+    rest(2);
+    input_mic_set_state(ctx, false, false);
+    rest(2);
+    check_settled(r, mark, "mic on and off at rest");
+    finish();
+}
+
+static void mic_at_start(void)
+{
+    begin(DEV_START);
+    start();
+    check(input_mic_set_state(ctx, true, false), "mic stream on before the first sample");
+    rest(1);
+    input_mic_set_state(ctx, false, false);
+    rest(0.5);
+    size_t mark = mock_nstates();
+    Ref r = ref_now();
+    rest(2);
+    check_settled(r, mark, "hidraw to evdev after start-up");
+    finish();
+}
+
+static void mic_sweep(void)
+{
+    begin(DEV_START);
+    start();
+    rest(1);
+    Ref r = ref_now();
+    size_t mark = mock_nstates();
+    spin(1, 90, 0.4);
+    input_mic_set_state(ctx, true, false);
+    spin(1, 90, 0.4);
+    spin(1, -90, 0.4);
+    input_mic_set_state(ctx, false, false);
+    spin(1, -90, 0.4);
+    rest(2);
+    check_settled(r, mark, "mic on and off during a sweep");
+    finish();
+}
+
+static void stray_mic(void)
+{
+    begin(DEV_START);
+    start();
+    rest(0.5);
+    size_t mark = mock_nstates();
+    Ref r = ref_now();
+    mock_hid_mic(&pad, 1);
+    rest(2);
+    check_settled(r, mark, "stray mic frame at start-up");
+    spin(1, 90, 0.5);
+    check(fabs(yaw_error(r)) < MAX_YAW_ERR, "aiming still follows the pad afterwards: yaw error %.2f deg", yaw_error(r));
+    finish();
+}
+
 /* After a reset the pad's pose is the new zero, and the next 45 deg turn must read as 45 deg. */
 static void after_reset(const char *what, bool zeroed)
 {
@@ -275,7 +339,7 @@ static void after_reset(const char *what, bool zeroed)
     if (zeroed)
         check(tilt_of(s) < 3 && fabs(yaw_of(s)) < 3, "%s: pose is the new zero: yaw %.2f deg, tilt %.2f deg", what, yaw_of(s), tilt_of(s));
     else
-        check(tilt_error() < MAX_TILT_ERR && fabs(yaw_of(s)) < 3, "%s: tilt error %.2f deg, yaw %.2f deg", what, tilt_error(), yaw_of(s));
+        check(tilt_error() < MAX_START_TILT_ERR && fabs(yaw_of(s)) < 3, "%s: tilt error %.2f deg, yaw %.2f deg", what, tilt_error(), yaw_of(s));
     rest(1);
     double y0 = yaw_of(last_state());
     spin(1, 90, 0.5);
@@ -303,6 +367,21 @@ static void reset_first(void)
     input_motion_reset(ctx);
     rest(2);
     after_reset("reset before the first sample", false);
+    finish();
+}
+
+static void reset_hid(void)
+{
+    begin(DEV_START);
+    start();
+    rest(1);
+    input_mic_set_state(ctx, true, false);
+    rest(1);
+    input_motion_reset(ctx);
+    rest(0.5);
+    input_mic_set_state(ctx, false, false);
+    rest(2);
+    after_reset("reset while hidraw owns the pad", true);
     finish();
 }
 
@@ -390,9 +469,12 @@ static const struct { const char *name; void (*fn)(void); } scenarios[] = {
     { "level_start", level_start },     { "tilted_start", tilted_start },
     { "sweep_evdev", sweep_evdev },     { "sweep_hidraw", sweep_hidraw },
     { "units_evdev", units_evdev },     { "units_hidraw", units_hidraw },
+    { "mic_rest", mic_rest },           { "mic_at_start", mic_at_start },
+    { "mic_sweep", mic_sweep },         { "stray_mic", stray_mic },
     { "reset_mid", reset_mid },         { "reset_first", reset_first },
-    { "hotplug", hotplug },             { "hotplug_mic", hotplug_mic },
-    { "ts_wrap", ts_wrap },             { "outputs", outputs },
+    { "reset_hid", reset_hid },         { "hotplug", hotplug },
+    { "hotplug_mic", hotplug_mic },     { "ts_wrap", ts_wrap },
+    { "outputs", outputs },
 };
 #define NSCEN (int)(sizeof(scenarios) / sizeof(scenarios[0]))
 

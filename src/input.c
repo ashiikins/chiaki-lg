@@ -144,8 +144,13 @@ typedef struct {
     ChordState chord;
 } GamepadDev;
 
+// Time base of the tracker's timestamps: MSC_TIMESTAMP counts the pad's own clock, hidraw
+// samples are stamped with the host's. The two share no origin.
+typedef enum { MOTION_CLOCK_NONE, MOTION_CLOCK_PAD, MOTION_CLOCK_HOST } MotionClock;
+
 typedef struct {
     ChiakiOrientationTracker tracker;
+    MotionClock              clock;
     ChiakiAccelNewZero       zero;   // accel offset set by a PS5 motion reset
     ChiakiAccelNewZero       real;   // last real accel sample (in g)
 } MotionState;
@@ -505,6 +510,7 @@ static bool apply_touch_event(ChiakiControllerState *st, GamepadDev *d,
 static void motion_init(MotionState *m)
 {
     chiaki_orientation_tracker_init(&m->tracker);
+    m->clock = MOTION_CLOCK_NONE;
     chiaki_accel_new_zero_set_inactive(&m->zero, false);
     chiaki_accel_new_zero_set_inactive(&m->real, true);
 }
@@ -517,9 +523,13 @@ static uint32_t monotonic_us(void)
 }
 
 // One sample: v = accel x,y,z in g, gyro x,y,z in deg/s.
-static void motion_sample(ChiakiControllerState *st, MotionState *m, const float v[6], uint32_t ts_us)
+static void motion_sample(ChiakiControllerState *st, MotionState *m, const float v[6], uint32_t ts_us, MotionClock clock)
 {
     const float deg2rad = (float)(M_PI / 180.0);
+    if (m->clock != clock) {   // the tracker would integrate the gap between two time bases: minutes of rotation
+        m->clock = clock;
+        m->tracker.timestamp = ts_us;
+    }
     float gx = v[3] * deg2rad, gy = v[4] * deg2rad, gz = v[5] * deg2rad;
     chiaki_accel_new_zero_set_active(&m->real, v[0], v[1], v[2], true);
     chiaki_orientation_tracker_update(&m->tracker, gx, gy, gz, v[0], v[1], v[2], &m->zero, false, ts_us);
@@ -539,7 +549,8 @@ static bool apply_motion_event(ChiakiControllerState *st, GamepadDev *d, MotionS
         int res = d->motion_res[i] > 0 ? d->motion_res[i] : (i < 3 ? 8192 : 1024);
         v[i] = (float)d->motion_raw[i] / (float)res;
     }
-    motion_sample(st, m, v, d->motion_have_ts ? d->motion_ts : monotonic_us());
+    if (d->motion_have_ts) motion_sample(st, m, v, d->motion_ts, MOTION_CLOCK_PAD);
+    else motion_sample(st, m, v, monotonic_us(), MOTION_CLOCK_HOST);
     return true;
 }
 
@@ -586,7 +597,7 @@ static void apply_ds5_input(ChiakiControllerState *st, GamepadDev *pad, MotionSt
     ds5_calibrate(&pad->calib, in, g, a);
     float v[6] = { a[0] / 8192.0f, a[1] / 8192.0f, a[2] / 8192.0f,
                    g[0] / 1024.0f, g[1] / 1024.0f, g[2] / 1024.0f };
-    motion_sample(st, m, v, monotonic_us());
+    motion_sample(st, m, v, monotonic_us(), MOTION_CLOCK_HOST);
 }
 
 // hidraw owns the pad state while the mic streams and until 300 ms after the last mic frame:
