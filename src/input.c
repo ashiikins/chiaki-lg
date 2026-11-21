@@ -124,7 +124,10 @@ typedef struct {
     int      hid_fd;         // DualSense hidraw for output reports, -1 = none (out_mutex)
     bool     ds5_enhanced;   // firmware 2.24+ rumble mode (or firmware unknown)
     Ds5Calib calib;          // IMU calibration for state read from hidraw
-    bool     mute_prev;      // mic mute button was down in the last hidraw report
+    bool     mute_prev;      // mic mute button was down in the last state report
+    bool     kern_mute_prev; // mic mute bit in the last 0x31 report of any kind (kernel's view)
+    bool     mic_fix_due;    // send the unmute write with the next report (after the kernel's write)
+    bool     kern_muted;     // estimate of hid-playstation's mic_muted toggle (relearned from status)
     uint32_t hid_buttons;    // buttons this pad set from hidraw
     int      ff_id;          // uploaded FF_RUMBLE effect id, -1 = none
     bool     ff_rumble;      // Sony pad opened read-write with FF_RUMBLE support
@@ -169,6 +172,16 @@ struct InputContext {
     InputMicHandler       mic;
     uint32_t              hid_mic_frames, hid_state_reports;
     uint32_t              hid_log_us;   // last pad-state log line while the mic streams
+    // hid-playstation reads the mic-mute button bit in every 0x31 input report, mic frames
+    // included, and toggles the controller's hardware mic mute on each rising edge. Opus
+    // bytes make that happen ~30 times a second, so each such edge is answered at once.
+    uint32_t              kern_mute_edges;   // rising edges inside mic frames while streaming
+    uint32_t              mic_fixes;         // mic-state writes sent to undo them
+    bool                  mic_want_valid;    // mic state set by input_mic_set_state
+    bool                  mic_want_muted;    // wanted controller mic mute (= not streaming)
+    bool                  mic_want_led;      // wanted mute LED
+    uint32_t              muted_reports;     // state reports with the controller's mic muted
+    int                   pad_mic_muted;     // controller status mic-mute bit, -1 unknown
 
     GamepadDev    pads[MAX_DEVS];
     int           num_pads;       // all opened nodes (gamepads and companions)
@@ -566,6 +579,18 @@ static void apply_ds5_input(ChiakiControllerState *st, GamepadDev *pad, MotionSt
     motion_sample(st, m, v, monotonic_us());
 }
 
+// The wanted mic state again (0x31: mic volume, mic mute, mute LED), to undo the kernel's toggles.
+static void ds5_mic_state_write(InputContext *ctx, GamepadDev *pad)
+{
+    uint8_t c[DS5_COMMON_SIZE] = {0}, rep[DS5_BT_REPORT_SIZE];
+    ds5_set_mic(c, ctx->mic_want_muted);
+    c[DS5_MUTE_LED] = ctx->mic_want_led ? 1 : 0;
+    pthread_mutex_lock(&ctx->out_mutex);
+    ds5_bt_report(rep, ctx->out_seq++, c);
+    if (write(pad->hid_fd, rep, sizeof(rep)) == (ssize_t)sizeof(rep)) ctx->mic_fixes++;
+    pthread_mutex_unlock(&ctx->out_mutex);
+}
+
 // Read the pad's hidraw: mic frames to the mic handler, mute-button presses to the
 // handler, and (while the mic streams) the pad state.
 static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
@@ -578,10 +603,26 @@ static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
         const uint8_t *opus = NULL;
         size_t opus_len = 0;
         Ds5InKind kind = ds5_parse_bt_input(buf, (size_t)n, &in, &opus, &opus_len);
+        bool kern_edge = false;
+        if (pad->mic_fix_due) {   // the kernel's write for the last edge has been queued by now
+            pad->mic_fix_due = false;
+            if (ctx->mic_stream) ds5_mic_state_write(ctx, pad);
+        }
+        if (n >= 12 && buf[0] == 0x31) {   // the byte hid-playstation reads as buttons[2]
+            bool kb = buf[11] & 0x04;
+            kern_edge = kb && !pad->kern_mute_prev;
+            pad->kern_mute_prev = kb;
+            if (kern_edge) pad->kern_muted = !pad->kern_muted;   // the kernel toggles on every edge
+        }
         if (kind == DS5_IN_MIC) {
             ctx->hid_mic_frames++;
+            if (kern_edge && ctx->mic_stream) {   // phantom mute press
+                ctx->kern_mute_edges++;
+                if (pad->kern_muted)               // the kernel is muting: undo it after its write
+                    pad->mic_fix_due = true;
+            }
             if (ctx->mic_stream && ctx->mic.opus_frame)
-                ctx->mic.opus_frame(opus, opus_len, ctx->mic.user);
+                ctx->mic.opus_frame(opus, opus_len, in.mic_seq, ctx->mic.user);
             continue;
         }
         if (kind != DS5_IN_STATE) continue;
@@ -590,6 +631,15 @@ static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
         if (mute && !pad->mute_prev && ctx->mic.mute_button)
             ctx->mic.mute_button(ctx->mic.user);
         pad->mute_prev = mute;
+        int pm = ds5_mic_muted(&in);
+        if (pm != ctx->pad_mic_muted && !ctx->mic_stream)
+            app_log("[INPUT] controller mic mute: %s\n", pm ? "on" : "off");
+        ctx->pad_mic_muted = pm;
+        if (ctx->mic_want_valid && pm != (int)ctx->mic_want_muted) {   // backstop: kernel toggled it
+            if (ctx->mic_stream) ctx->muted_reports++;
+            pad->kern_muted = pm;   // only the kernel writes the other state: relearn its toggle
+            ds5_mic_state_write(ctx, pad);
+        }
         if (!ctx->mic_stream) continue;
         pthread_mutex_lock(&ctx->state_mutex);
         apply_ds5_input(&ctx->state, pad, &ctx->motion, &in);
@@ -598,9 +648,9 @@ static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
         uint32_t t = monotonic_us();
         if ((uint32_t)(t - ctx->hid_log_us) >= 5000000u) {
             ctx->hid_log_us = t;
-            app_log("[INPUT] hidraw pad: buttons=%#x L2=%u R2=%u sticks %d,%d %d,%d (reports %u state, %u mic)\n",
+            app_log("[INPUT] hidraw pad: buttons=%#x L2=%u R2=%u sticks %d,%d %d,%d (reports %u state, %u mic; kernel mute toggles %u, unmute writes %u, muted state reports %u)\n",
                     snap.buttons, snap.l2_state, snap.r2_state, snap.left_x, snap.left_y,
-                    snap.right_x, snap.right_y, ctx->hid_state_reports, ctx->hid_mic_frames);
+                    snap.right_x, snap.right_y, ctx->hid_state_reports, ctx->hid_mic_frames, ctx->kern_mute_edges, ctx->mic_fixes, ctx->muted_reports);
         }
         if (ctx->session)
             chiaki_session_set_controller_state(ctx->session, &snap);
@@ -1046,6 +1096,7 @@ InputContext *input_init(void)
     pthread_mutex_init(&ctx->state_mutex, NULL);
     pthread_mutex_init(&ctx->out_mutex, NULL);
     ctx->running = true;
+    ctx->pad_mic_muted = -1;
     ctx->session = NULL;
 
     open_gamepads(ctx);
@@ -1239,6 +1290,9 @@ bool input_mic_set_state(InputContext *ctx, bool stream, bool mute_led)
     ds5_set_mic(c, !stream);
     c[DS5_MUTE_LED] = mute_led ? 1 : 0;
     pthread_mutex_lock(&ctx->out_mutex);
+    ctx->mic_want_muted = !stream;
+    ctx->mic_want_led = mute_led;
+    ctx->mic_want_valid = true;
     for (int i = 0; i < ctx->num_pads; i++) {
         GamepadDev *d = &ctx->pads[i];
         if (d->hid_fd < 0) continue;

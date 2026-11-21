@@ -5,7 +5,7 @@
 #include <string.h>
 
 #define DS5_IN_OFS 2          /* report id, then the tag/sequence byte */
-#define DS5_IN_MIN 42         /* through the second touch point */
+#define DS5_IN_MIN 57         /* through the status bytes */
 #define DS5_MIC_OPUS_OFS 3
 #define DS5_MIC_OPUS_LEN 71
 
@@ -17,6 +17,7 @@ Ds5InKind ds5_parse_bt_input(const uint8_t *buf, size_t len, Ds5Input *out,
     if (len < DS5_IN_MIN || buf[0] != 0x31) return DS5_IN_NONE;
     if (buf[1] & 0x02) {
         if (len < DS5_MIC_OPUS_OFS + DS5_MIC_OPUS_LEN) return DS5_IN_NONE;
+        out->mic_seq = buf[2];
         if (opus) *opus = buf + DS5_MIC_OPUS_OFS;
         if (opus_len) *opus_len = DS5_MIC_OPUS_LEN;
         return DS5_IN_MIC;
@@ -36,6 +37,7 @@ Ds5InKind ds5_parse_bt_input(const uint8_t *buf, size_t len, Ds5Input *out,
         out->touch[t].x = (uint16_t)(((p[2] & 0x0f) << 8) | p[1]);
         out->touch[t].y = (uint16_t)((p[3] << 4) | (p[2] >> 4));
     }
+    memcpy(out->status, r + 52, 3);
     return DS5_IN_STATE;
 }
 
@@ -69,6 +71,7 @@ uint32_t ds5_chiaki_buttons(const Ds5Input *in)
 }
 
 bool ds5_mute_button(const Ds5Input *in) { return in->buttons[2] & 0x04; }
+bool ds5_mic_muted(const Ds5Input *in) { return in->status[1] & 0x04; }
 
 bool ds5_calib_from_feature(Ds5Calib *c, const uint8_t *b, size_t len)
 {

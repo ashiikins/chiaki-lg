@@ -13,7 +13,7 @@
  * Layout (as hid-playstation's struct dualsense_input_report, at byte 2):
  *   0 lx  1 ly  2 rx  3 ry  4 l2  5 r2  6 seq  7..10 buttons
  *   15..20 gyro (le16 pitch, yaw, roll)  21..26 accel (le16 x, y, z)
- *   27..30 sensor timestamp  32..39 two touch points
+ *   27..30 sensor timestamp  32..39 two touch points  52..54 status
  */
 
 typedef enum { DS5_IN_NONE = 0, DS5_IN_STATE, DS5_IN_MIC } Ds5InKind;
@@ -24,9 +24,12 @@ typedef struct {
     int16_t  gyro[3];       /* raw */
     int16_t  accel[3];      /* raw */
     struct { bool active; uint8_t id; uint16_t x, y; } touch[2];
+    uint8_t  status[3];     /* battery, jack/mic-mute (status[1] bit 2), ... */
+    uint8_t  mic_seq;       /* mic frames: 8-bit frame counter (byte 2) */
 } Ds5Input;
 
-/* Classify and parse a hidraw read. Mic frames: *opus points at the 71-byte packet. */
+/* Classify and parse a hidraw read. Byte 1: report sequence << 4 | 1 (state) or 2 (mic).
+ * Mic frames: *opus points at the 71-byte packet, out->mic_seq is the frame counter. */
 Ds5InKind ds5_parse_bt_input(const uint8_t *buf, size_t len, Ds5Input *out,
                              const uint8_t **opus, size_t *opus_len);
 
@@ -34,6 +37,8 @@ Ds5InKind ds5_parse_bt_input(const uint8_t *buf, size_t len, Ds5Input *out,
  * Options, PS, touchpad click). */
 uint32_t ds5_chiaki_buttons(const Ds5Input *in);
 bool ds5_mute_button(const Ds5Input *in);
+/* The controller's own mic mute state (status[1] bit 2). */
+bool ds5_mic_muted(const Ds5Input *in);
 
 /* IMU calibration from feature report 0x05, applied as hid-playstation does. */
 typedef struct {

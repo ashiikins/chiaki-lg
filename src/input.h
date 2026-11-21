@@ -26,7 +26,7 @@ bool input_has_dualsense_output(InputContext *ctx);
 
 // DualSense Bluetooth microphone. The handler is called from the input thread.
 typedef struct {
-    void (*opus_frame)(const uint8_t *opus, size_t len, void *user);  // 48 kHz mono, 10 ms
+    void (*opus_frame)(const uint8_t *opus, size_t len, uint8_t seq, void *user);  // 48 kHz mono, 10 ms; seq = frame counter
     void (*mute_button)(void *user);                                   // mic button pressed
     void *user;
 } InputMicHandler;

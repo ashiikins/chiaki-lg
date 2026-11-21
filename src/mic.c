@@ -14,6 +14,7 @@
 #define MIC_PACKET    40      // chiaki's audio sender accepts only 40-byte packets
 #define MIC_BITRATE   (MIC_PACKET * 8 * 100)   // CBR: 40 bytes every 10 ms
 #define MIC_STATS_MS  5000
+#define MIC_MAX_CONCEAL 5     // frames lost on the link are concealed up to 50 ms
 
 struct MicContext {
     InputContext      *input;
@@ -28,7 +29,9 @@ struct MicContext {
     bool               mic_connected;
     bool               muted;
     // statistics since the last log line
-    unsigned           frames, decode_fail, encode_fail, sent;
+    unsigned           frames, decode_fail, encode_fail, sent, zero_frames, concealed, lost;
+    bool               have_seq;
+    uint8_t            last_seq;
     int                peak;
     double             sum_sq;
     unsigned           samples;
@@ -50,26 +53,53 @@ static void stats_log(MicContext *m, bool force)
     double secs = (t - m->stats_ms) / 1000.0;
     if (m->frames || force) {
         double rms = m->samples ? sqrt(m->sum_sq / m->samples) : 0.0;
-        app_log_always("[MIC] %.1f frames/s, decode ok %u fail %u, sent %u (encode fail %u), PCM peak %d rms %.0f\n",
+        app_log_always("[MIC] %.1f frames/s, decode ok %u fail %u, sent %u (encode fail %u), PCM peak %d rms %.0f, all-zero frames %u, lost %u (concealed %u)\n",
                        secs > 0 ? m->frames / secs : 0.0, m->frames - m->decode_fail, m->decode_fail,
-                       m->sent, m->encode_fail, m->peak, rms);
+                       m->sent, m->encode_fail, m->peak, rms, m->zero_frames, m->lost, m->concealed);
     }
-    m->frames = m->decode_fail = m->encode_fail = m->sent = 0;
+    m->frames = m->decode_fail = m->encode_fail = m->sent = m->zero_frames = m->concealed = m->lost = 0;
     m->peak = 0; m->sum_sq = 0; m->samples = 0;
     m->stats_ms = t;
 }
 
+// Encode one decoded 10 ms mono frame as chiaki-ng's stereo mic packet and send it.
+static void send_pcm(MicContext *m, const int16_t *mono)
+{
+    int16_t stereo[MIC_FRAME * 2];
+    uint8_t pkt[MIC_PACKET];
+    for (int i = 0; i < MIC_FRAME; i++) stereo[2 * i] = stereo[2 * i + 1] = mono[i];
+    int r = opus_encode(m->enc, stereo, MIC_FRAME, pkt, sizeof(pkt));
+    if (r == MIC_PACKET) {
+        chiaki_audio_sender_opus_data(m->sender, pkt, (size_t)r);
+        m->sent++;
+    } else {
+        m->encode_fail++;
+    }
+}
+
 // Input thread: one Opus packet from the controller.
-static void on_opus_frame(const uint8_t *opus, size_t len, void *user)
+static void on_opus_frame(const uint8_t *opus, size_t len, uint8_t seq, void *user)
 {
     MicContext *m = user;
     int16_t mono[MIC_FRAME];
-    int16_t stereo[MIC_FRAME * 2];
-    uint8_t pkt[MIC_PACKET];
 
     pthread_mutex_lock(&m->mutex);
     if (m->muted || !m->sender) { pthread_mutex_unlock(&m->mutex); return; }
     m->frames++;
+    // Frames lost on the link: Opus concealment keeps the PS5's stream at 100 packets/s.
+    if (m->have_seq) {
+        unsigned gap = (uint8_t)(seq - m->last_seq - 1);
+        if (gap > 0 && gap < 128) {
+            m->lost += gap;
+            for (unsigned g = 0; g < gap && g < MIC_MAX_CONCEAL; g++) {
+                if (opus_decode(m->dec, NULL, 0, mono, MIC_FRAME, 0) != MIC_FRAME) break;
+                send_pcm(m, mono);
+                m->concealed++;
+            }
+        }
+    }
+    m->have_seq = true;
+    m->last_seq = seq;
     int n = opus_decode(m->dec, opus, (opus_int32)len, mono, MIC_FRAME, 0);
     if (!m->first_logged) {
         m->first_logged = true;
@@ -79,20 +109,16 @@ static void on_opus_frame(const uint8_t *opus, size_t len, void *user)
     if (n != MIC_FRAME) {
         m->decode_fail++;
     } else {
+        int fpeak = 0;
         for (int i = 0; i < MIC_FRAME; i++) {
             int a = abs(mono[i]);
+            if (a > fpeak) fpeak = a;
             if (a > m->peak) m->peak = a;
             m->sum_sq += (double)mono[i] * mono[i];
-            stereo[2 * i] = stereo[2 * i + 1] = mono[i];
         }
         m->samples += MIC_FRAME;
-        int r = opus_encode(m->enc, stereo, MIC_FRAME, pkt, sizeof(pkt));
-        if (r == MIC_PACKET) {
-            chiaki_audio_sender_opus_data(m->sender, pkt, (size_t)r);
-            m->sent++;
-        } else {
-            m->encode_fail++;
-        }
+        if (fpeak == 0) m->zero_frames++;
+        send_pcm(m, mono);
     }
     stats_log(m, false);
     pthread_mutex_unlock(&m->mutex);
@@ -117,7 +143,7 @@ static void on_mute_button(void *user)
     }
     ChiakiErrorCode e = chiaki_session_toggle_microphone(m->session, mute);
     m->muted = mute;
-    if (!mute) { m->stats_ms = now_ms(); m->frames = 0; }
+    if (!mute) { m->stats_ms = now_ms(); m->frames = 0; m->have_seq = false; }
     else stats_log(m, true);
     pthread_mutex_unlock(&m->mutex);
     // Outside the lock: the input thread delivers frames under the input mutexes.
