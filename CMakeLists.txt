@@ -128,6 +128,7 @@ add_executable(chiaki-webos
     src/config.c
     src/config_import.c
     src/video.c
+    src/hevc_rps.c
     src/audio.c
     src/input.c
     src/ui.c

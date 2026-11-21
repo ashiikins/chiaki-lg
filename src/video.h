@@ -7,11 +7,10 @@
 
 typedef struct VideoContext VideoContext;
 
-VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, int chiaki_codec);
+/* hevc_rps_keep: see HevcRps; only used for H.265 sessions, 0 disables. */
+VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, int chiaki_codec,
+                         int hevc_rps_keep);
 void          video_fini(VideoContext *ctx);
 
-/* Actual ChiakiVideoSampleCallback typedef (confirmed from build error output):
- *   bool (*)(uint8_t *buf, unsigned int buf_size, int codec, bool is_keyframe, void *user)
- * chiaki passes codec type and keyframe flag — no need to parse NAL headers ourselves.
- * Returns true on success; chiaki logs a warning if false is returned. */
-bool video_sample_cb(uint8_t *buf, unsigned int buf_size, int codec, bool is_keyframe, void *user);
+/* Matches ChiakiVideoSampleCallback in chiaki-ng's session.h. */
+bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user);
