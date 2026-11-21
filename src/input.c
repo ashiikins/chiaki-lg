@@ -818,7 +818,7 @@ static void *evdev_reader(void *arg)
             }
         }
 
-        if (maxfd < 0) { usleep(50000); continue; }
+        if (maxfd < 0) { hotplug_rescan(ctx); usleep(50000); continue; }   // nothing open: still look for the pad's new nodes
 
         struct timeval tv = { .tv_sec = 0, .tv_usec = 20000 }; // 20ms for chord responsiveness
         int sel = select(maxfd + 1, &rfds, NULL, NULL, &tv);

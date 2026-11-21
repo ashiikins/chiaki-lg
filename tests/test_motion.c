@@ -88,6 +88,7 @@ typedef struct { double R[3][3]; double bias[3]; uint32_t dev_ts; unsigned n; ui
 static InputContext *ctx;
 static MockPad pad;
 static Sim sim;
+static bool with_remote = true;
 
 static void rotate(Sim *s, const double w[3], double dt)
 {
@@ -152,7 +153,7 @@ static void begin(uint32_t dev_start)
     sim.dev_ts = dev_start;
     tilt_start(6);                                                    /* held roughly level, not exactly */
     mock_init(BOOT_US);
-    mock_plug_remote();
+    if (with_remote) mock_plug_remote();
     pad = mock_plug_dualsense("aa:bb:cc:dd:ee:ff");
 }
 
@@ -407,6 +408,12 @@ static void hotplug(void)
     finish();
 }
 
+static void hotplug_only_pad(void)
+{
+    with_remote = false;
+    hotplug();
+}
+
 static void hotplug_mic(void)
 {
     begin(DEV_START);
@@ -473,7 +480,8 @@ static const struct { const char *name; void (*fn)(void); } scenarios[] = {
     { "mic_sweep", mic_sweep },         { "stray_mic", stray_mic },
     { "reset_mid", reset_mid },         { "reset_first", reset_first },
     { "reset_hid", reset_hid },         { "hotplug", hotplug },
-    { "hotplug_mic", hotplug_mic },     { "ts_wrap", ts_wrap },
+    { "hotplug_only_pad", hotplug_only_pad }, { "hotplug_mic", hotplug_mic },
+    { "ts_wrap", ts_wrap },
     { "outputs", outputs },
 };
 #define NSCEN (int)(sizeof(scenarios) / sizeof(scenarios[0]))
