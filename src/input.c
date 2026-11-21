@@ -147,6 +147,11 @@ struct InputContext {
     uint8_t               out_seq;
     unsigned              out_logged;    // one log line per report kind
     bool                  trig_valid;
+    // haptics -> rumble (chiaki-ng's method, "Normal" strength)
+    uint32_t              hap_sum;
+    int                   hap_frames;
+    uint8_t               hap_sent;      // last strength sent, 0 = motors off
+    struct timespec       hap_last;      // last frame received
     uint8_t               trig_last[22];
     pthread_mutex_t       state_mutex;
 
@@ -508,6 +513,8 @@ static void motion_reset(ChiakiControllerState *st, MotionState *m)
 }
 
 // ── Evdev reader thread ────────────────────────────────────────────────────────
+static void haptics_idle_check(InputContext *ctx);
+
 static void *evdev_reader(void *arg)
 {
     InputContext *ctx = (InputContext *)arg;
@@ -543,6 +550,7 @@ static void *evdev_reader(void *arg)
             }
         }
 
+        haptics_idle_check(ctx);
         if (sel <= 0) continue;
 
         for (int i = 0; i < ctx->num_pads; i++) {
@@ -945,6 +953,30 @@ static void pad_rumble(GamepadDev *d, uint8_t left, uint8_t right)
     (void)!write(d->fd, &play, sizeof(play));
 }
 
+// Strength of one haptics frame, as chiaki-ng: mean of 2*|sample| per channel, the
+// louder channel, below 100 = silence, non-zero values raised to at least 512.
+static uint16_t haptics_strength(const uint8_t *buf, size_t size)
+{
+    size_t n = size / 4;
+    if (!n) return 0;
+    uint32_t suml = 0, sumr = 0;
+    for (size_t i = 0; i < n; i++) {
+        int16_t l, r;
+        memcpy(&l, buf + i * 4, 2);
+        memcpy(&r, buf + i * 4 + 2, 2);
+        suml += (uint32_t)abs(l) * 2;
+        sumr += (uint32_t)abs(r) * 2;
+    }
+    uint32_t sl = suml / n, sr = sumr / n;
+    uint32_t s = sl > sr ? sl : sr;
+    if (s <= 100) return 0;
+    if (s < 512) s = 512;
+    return s > 65535 ? 65535 : (uint16_t)s;
+}
+
+#define HAPTICS_FRAMES_PER_RUMBLE 3     // ~30 ms per motor update, as chiaki-ng
+#define HAPTICS_IDLE_STOP_MS      100
+
 void input_set_rumble(InputContext *ctx, uint8_t left, uint8_t right)
 {
     if (!ctx) return;
@@ -1040,11 +1072,47 @@ bool input_has_dualsense_output(InputContext *ctx)
     return any;
 }
 
+void input_haptics_frame(InputContext *ctx, const uint8_t *buf, size_t size)
+{
+    if (!ctx) return;
+    uint16_t s = haptics_strength(buf, size);
+    pthread_mutex_lock(&ctx->state_mutex);
+    get_monotonic(&ctx->hap_last);
+    ctx->hap_sum += s;
+    if (++ctx->hap_frames < HAPTICS_FRAMES_PER_RUMBLE) { pthread_mutex_unlock(&ctx->state_mutex); return; }
+    uint8_t level = (uint8_t)((ctx->hap_sum / HAPTICS_FRAMES_PER_RUMBLE) >> 8);
+    ctx->hap_sum = 0;
+    ctx->hap_frames = 0;
+    if (level != ctx->hap_sent) {
+        ctx->hap_sent = level;
+        for (int i = 0; i < ctx->num_pads; i++)
+            if (ctx->pads[i].kind == DEV_PAD) pad_rumble(&ctx->pads[i], level, level);
+    }
+    pthread_mutex_unlock(&ctx->state_mutex);
+}
+
+// Reader tick: haptics frames stopped while the motors run -> stop them.
+static void haptics_idle_check(InputContext *ctx)
+{
+    pthread_mutex_lock(&ctx->state_mutex);
+    if (ctx->hap_sent && ms_elapsed(&ctx->hap_last) >= HAPTICS_IDLE_STOP_MS) {
+        ctx->hap_sent = 0;
+        ctx->hap_sum = 0;
+        ctx->hap_frames = 0;
+        for (int i = 0; i < ctx->num_pads; i++)
+            if (ctx->pads[i].kind == DEV_PAD) pad_rumble(&ctx->pads[i], 0, 0);
+    }
+    pthread_mutex_unlock(&ctx->state_mutex);
+}
+
 void input_set_session(InputContext *ctx, ChiakiSession *session)
 {
     if (!ctx) return;
     if (!session) {
         input_set_rumble(ctx, 0, 0);
+        pthread_mutex_lock(&ctx->state_mutex);
+        ctx->hap_sent = 0; ctx->hap_sum = 0; ctx->hap_frames = 0;
+        pthread_mutex_unlock(&ctx->state_mutex);
         ds5_triggers_off(ctx);
         // Session over: no contact may stay down into the next session.
         pthread_mutex_lock(&ctx->state_mutex);

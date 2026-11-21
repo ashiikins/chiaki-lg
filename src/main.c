@@ -129,6 +129,11 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 
 // Set while input is initialised; the session callback runs on a chiaki thread.
 static InputContext *g_input_ctx;
+static void haptics_frame_cb(uint8_t *buf, size_t buf_size, void *user)
+{
+    input_haptics_frame((InputContext *)user, buf, buf_size);
+}
+
 static unsigned g_ds_events_logged;   // one log line per DualSense event type
 
 static void session_event_cb(ChiakiEvent *event, void *user)
@@ -1310,6 +1315,12 @@ int main(int argc, char *argv[])
 
     info.video_profile.codec = requested_codec;
 
+    // DualSense mode only with a DualSense whose output reports work: the PS5 then sends
+    // haptics as audio (turned into rumble) instead of rumble events.
+    info.enable_dualsense = cfg.enable_dualsense && input_has_dualsense_output(input_ctx);
+    app_log("[APP] DualSense mode: %s\n", info.enable_dualsense ? "on" :
+            cfg.enable_dualsense ? "off (no DualSense with Bluetooth output)" : "off (config)");
+
     // ── Session / reconnect loop ──────────────────────────────────────────────
     // We stay inside this loop until the user deliberately exits (Home button,
     // SIGTERM) or the PS5 requests a clean disconnect.  On network errors we
@@ -1450,6 +1461,11 @@ int main(int argc, char *argv[])
         chiaki_session_set_video_sample_cb(&g_session,
             video_sample_cb, video_ctx);
         app_log("[APP] Video callback registered\n");
+
+        if (info.enable_dualsense) {
+            ChiakiAudioSink haptics_sink = { .user = input_ctx, .header_cb = NULL, .frame_cb = haptics_frame_cb };
+            chiaki_session_set_haptics_sink(&g_session, &haptics_sink);
+        }
 
         ChiakiAudioSink audio_sink = audio_make_sink(audio_ctx);
         chiaki_session_set_audio_sink(&g_session, &audio_sink);

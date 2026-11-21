@@ -24,6 +24,9 @@ void input_set_triggers(InputContext *ctx, uint8_t type_left, const uint8_t left
                         uint8_t type_right, const uint8_t right[10]);
 bool input_has_dualsense_output(InputContext *ctx);
 
+// DualSense-mode haptics audio frame (stereo int16, ~10 ms): converted to rumble.
+void input_haptics_frame(InputContext *ctx, const uint8_t *buf, size_t size);
+
 // CHIAKI_EVENT_MOTION_RESET: make the current controller pose the new zero.
 void input_motion_reset(InputContext *ctx);
 

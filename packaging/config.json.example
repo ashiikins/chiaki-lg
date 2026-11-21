@@ -12,6 +12,7 @@
     "auto_connect": true,
     "auto_connect_delay_ms": 5000,
     "hevc_rps_keep": 4,
+    "enable_dualsense": false,
     "video_width": 1920,
     "video_height": 1080,
     "video_fps": 60,
