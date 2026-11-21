@@ -153,6 +153,15 @@ static bool apply_key_event(ChiakiControllerState *st, GamepadDev *pad,
         return true;
     }
 
+    // ── Sony pads have a real touchpad: Create/Options map directly, no chord ─
+    if (pad->sony_buttons && (code == BTN_SELECT || code == BTN_START)) {
+        uint32_t b = code == BTN_SELECT ? CHIAKI_CONTROLLER_BUTTON_SHARE
+                                        : CHIAKI_CONTROLLER_BUTTON_OPTIONS;
+        if (pressed) st->buttons |= b;
+        else         st->buttons &= ~b;
+        return true;
+    }
+
     // ── Select / Start: chord detection for Touchpad ─────────────────────────
     if (code == BTN_SELECT || code == BTN_START) {
         bool is_select = (code == BTN_SELECT);
@@ -513,7 +522,7 @@ static void open_gamepads(InputContext *ctx)
         app_log("[INPUT] No physical gamepads found — TV remote only\n");
     else {
         app_log("[INPUT] %d gamepad(s) grabbed exclusively\n", ctx->num_pads);
-        app_log("[INPUT] Touchpad: Select+Start chord (%dms window) + BTN_RECORD direct\n",
+        app_log("[INPUT] Touchpad on non-Sony pads: Select+Start chord (%dms window) + BTN_RECORD direct\n",
                 CHORD_WINDOW_MS);
     }
 }
