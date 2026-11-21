@@ -19,6 +19,8 @@ typedef struct {
     char    *ps5_mac;
     int      wakeup_delay_ms;
     bool     sleep_on_exit;
+    bool     auto_connect;      // connect automatically after a countdown (once per launch)
+    int      auto_connect_delay_ms; // countdown length; any input cancels it
     char    *ss4s_module;
     int      log_level;         // chiaki bitmask: DEBUG=1 VERBOSE=2 INFO=4 WARNING=8 ERROR=16
     // PSN cloud wakeup — needed when PS5 ignores local UDP wakeup (port 987).

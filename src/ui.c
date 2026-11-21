@@ -10,6 +10,7 @@
 #include <ctype.h>
 
 #include "config_import.h"
+#include "app_log.h"
 
 /* ── Layout ──────────────────────────────────────────────────────────────────
  * Two-panel layout:
@@ -1380,6 +1381,18 @@ UIResult ui_run_registration(SDL_Renderer *renderer, AppConfig *cfg,
     if (ui_valid_ipv4(ip) && ui_has_keys(cfg))
         focus = 14;
 
+    /* Auto-connect: once per launch, only when Connect would work right away.
+     * Any key or button press cancels the countdown and is otherwise ignored. */
+    static bool auto_connect_used = false;
+    bool   auto_pending  = false;
+    Uint32 auto_deadline = 0;
+    if (!auto_connect_used && cfg && cfg->auto_connect && focus == 14) {
+        auto_connect_used = true;
+        auto_pending  = true;
+        auto_deadline = SDL_GetTicks() + (Uint32)cfg->auto_connect_delay_ms;
+        app_log("[UI] Auto-connect to %s in %d ms (any input cancels)\n", ip, cfg->auto_connect_delay_ms);
+    }
+
     SDL_StartTextInput();
 
     while (1) {
@@ -1400,6 +1413,15 @@ UIResult ui_run_registration(SDL_Renderer *renderer, AppConfig *cfg,
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) return UI_RESULT_QUIT;
+
+            if (auto_pending &&
+                (ev.type == SDL_KEYDOWN || ev.type == SDL_CONTROLLERBUTTONDOWN ||
+                 ev.type == SDL_JOYBUTTONDOWN || ev.type == SDL_MOUSEBUTTONDOWN)) {
+                auto_pending = false;
+                snprintf(msg, sizeof(msg), "Auto-connect cancelled.");
+                app_log("[UI] Auto-connect cancelled by input (event 0x%x)\n", ev.type);
+                continue;
+            }
 
             if (ev.type == SDL_KEYDOWN) {
                 SDL_Keycode sym = ev.key.keysym.sym;
@@ -1583,6 +1605,27 @@ UIResult ui_run_registration(SDL_Renderer *renderer, AppConfig *cfg,
                     fake.type = SDL_KEYDOWN; fake.key.keysym.sym = fake_sym;
                     SDL_PushEvent(&fake);
                 }
+            }
+        }
+
+        if (auto_pending) {
+            Uint32 now = SDL_GetTicks();
+            if ((Sint32)(now - auto_deadline) >= 0) {
+                auto_pending = false;
+                /* Same steps as pressing Connect */
+                if (ui_valid_ipv4(ip) && ui_write_host(config_path, ip)) {
+                    ui_reload_cfg(cfg, config_path);
+                    if (ui_has_keys(cfg)) {
+                        app_log("[UI] Auto-connect: connecting to %s\n", ip);
+                        return UI_RESULT_CONNECT;
+                    }
+                }
+                snprintf(msg, sizeof(msg), "Auto-connect failed. Press Connect.");
+                app_log("[UI] Auto-connect aborted: host or keys not usable\n");
+            } else {
+                Uint32 left = auto_deadline - now;
+                snprintf(msg, sizeof(msg), "Connecting to %s in %u s ... press any button to cancel",
+                         ip, (unsigned)((left + 999) / 1000));
             }
         }
 

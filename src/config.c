@@ -50,6 +50,8 @@ static int config_write_defaults(const char *path)
         "  \"ps5_mac\": \"\",\n"
         "  \"wakeup_delay_ms\": 60000,\n"
         "  \"sleep_on_exit\": true,\n"
+        "  \"auto_connect\": true,\n"
+        "  \"auto_connect_delay_ms\": 5000,\n"
         "  \"log_level\": \"warning\",\n"
         "  \"psn_refresh_token\": \"\"\n"
         "}\n");
@@ -95,6 +97,10 @@ int config_load(AppConfig *cfg, const char *path)
     cfg->ps5_mac          = json_get_str(root,  "ps5_mac");
     cfg->wakeup_delay_ms  = json_get_int(root,  "wakeup_delay_ms",  60000);
     cfg->sleep_on_exit    = json_get_bool(root, "sleep_on_exit",    true);
+    cfg->auto_connect     = json_get_bool(root, "auto_connect",     true);
+    cfg->auto_connect_delay_ms = json_get_int(root, "auto_connect_delay_ms", 5000);
+    if (cfg->auto_connect_delay_ms < 0)     cfg->auto_connect_delay_ms = 0;
+    if (cfg->auto_connect_delay_ms > 60000) cfg->auto_connect_delay_ms = 60000;
 
     // log_level: string or legacy bool
     {
@@ -144,13 +150,14 @@ int config_load(AppConfig *cfg, const char *path)
     json_object_put(root);
 
     fprintf(stderr, "[CONFIG] Loaded: host=%s ps5=%d %dx%d@%dfps %dkbps "
-            "wakeup=%d psn_wakeup=%s sleep_on_exit=%d log_level=0x%x\n",
+            "wakeup=%d psn_wakeup=%s sleep_on_exit=%d auto_connect=%d/%dms log_level=0x%x\n",
             cfg->host ? cfg->host : "(null)", cfg->ps5,
             cfg->video_width, cfg->video_height,
             cfg->video_fps, cfg->video_bitrate,
             cfg->wakeup,
             cfg->psn_refresh_token ? "YES" : "NO",
-            cfg->sleep_on_exit, cfg->log_level);
+            cfg->sleep_on_exit, cfg->auto_connect, cfg->auto_connect_delay_ms,
+            cfg->log_level);
     return 0;
 }
 
