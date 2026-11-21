@@ -83,6 +83,7 @@ typedef struct {
     char path[64];
     int  abs_min[ABS_CNT];
     int  abs_max[ABS_CNT];
+    bool z_triggers;    // ABS_Z/ABS_RZ are L2/R2 (hid-playstation, hid-sony), not a right stick
     ChordState chord;
 } GamepadDev;
 
@@ -254,6 +255,20 @@ static void apply_abs_event(ChiakiControllerState *st, GamepadDev *pad,
     //   ABS_GAS   (9)  = L2 trigger, range 0-1023
     //   ABS_BRAKE (10) = R2 trigger, range 0-1023
     //   ABS_RX (3) and ABS_RY (4) are not used by this driver.
+    // Sony pads (hid-playstation / hid-sony) and pads detected by axis shape: ABS_Z = L2,
+    // ABS_RZ = R2 (0-255 on the DualSense),
+    // right stick on ABS_RX/ABS_RY.
+    if (pad->z_triggers && (code == ABS_Z || code == ABS_RZ)) {
+        uint8_t v = 0;
+        if (max > min) {
+            int32_t c = val < min ? min : (val > max ? max : val);
+            v = (uint8_t)(((int64_t)(c - min) * 255) / (max - min));
+        }
+        if (code == ABS_Z) st->l2_state = v;
+        else               st->r2_state = v;
+        return;
+    }
+
     switch (code) {
     case ABS_X:    st->left_x  = normalize_axis(val, min, max); break;
     case ABS_Y:    st->left_y  = normalize_axis(val, min, max); break;
@@ -463,6 +478,22 @@ static void open_gamepads(InputContext *ctx)
             app_log("[INPUT] EVIOCGRAB OK — exclusive control of \"%s\" (%s)\n",
                     devname, path);
         }
+
+        struct input_id id;
+        memset(&id, 0, sizeof(id));
+        pad->z_triggers = ioctl(fd, EVIOCGID, &id) == 0 && id.vendor == 0x054c;
+        if (!pad->z_triggers) {
+            // Fallback: right stick on RX/RY and ABS_Z/RZ resting at their minimum with no
+            // dead zone means Z/RZ are triggers, not a second stick.
+            struct input_absinfo z, rz, rx;
+            if (ioctl(fd, EVIOCGABS(ABS_Z), &z) == 0 && ioctl(fd, EVIOCGABS(ABS_RZ), &rz) == 0 &&
+                ioctl(fd, EVIOCGABS(ABS_RX), &rx) == 0 && rx.maximum > rx.minimum &&
+                z.maximum > z.minimum && rz.maximum > rz.minimum &&
+                z.flat == 0 && rz.flat == 0 && z.value == z.minimum && rz.value == rz.minimum)
+                pad->z_triggers = true;
+        }
+        app_log("[INPUT] \"%s\" vendor=%04x product=%04x triggers=%s\n", devname,
+                id.vendor, id.product, pad->z_triggers ? "ABS_Z/RZ" : "ABS_GAS/BRAKE");
 
         snprintf(pad->path, sizeof(pad->path), "%s", path);
         pad->fd = fd;
