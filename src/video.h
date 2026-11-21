@@ -7,7 +7,9 @@
 
 typedef struct VideoContext VideoContext;
 
-VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, int chiaki_codec);
+/* hevc_rps_keep: see HevcRps; only used for H.265 sessions, 0 disables. */
+VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, int chiaki_codec,
+                         int hevc_rps_keep);
 void          video_fini(VideoContext *ctx);
 
 /* Matches ChiakiVideoSampleCallback in chiaki-ng's session.h. */

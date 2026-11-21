@@ -1,5 +1,6 @@
 #include "video.h"
 #include "stats.h"
+#include "hevc_rps.h"
 #include <chiaki/session.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,7 @@ struct VideoContext {
     bool         opened;
     uint64_t     frame_count;
     unsigned     loss_events;
+    HevcRps      rps;           // H.265 RPS trimmer (keep=0 when off)
 };
 
 /* True if the Annex-B access unit contains an IDR (H.264) or IRAP (H.265) NAL. */
@@ -46,7 +48,8 @@ static bool au_is_keyframe(const uint8_t *b, size_t n, bool h265)
     return false;
 }
 
-VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, int chiaki_codec)
+VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, int chiaki_codec,
+                         int hevc_rps_keep)
 {
     VideoContext *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
@@ -54,6 +57,7 @@ VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, in
     ctx->player = player;
     ctx->codec = chiaki_codec;
     ctx->use_h265 = (chiaki_codec == CHIAKI_CODEC_H265 || chiaki_codec == CHIAKI_CODEC_H265_HDR);
+    hevc_rps_init(&ctx->rps, ctx->use_h265 ? hevc_rps_keep : 0);
 
     // Stats overlay format hint (also updated from callback codec)
     stats_set_video_format(&g_stream_stats, width, height, fps, chiaki_codec);
@@ -77,6 +81,8 @@ VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, in
     app_log("[VIDEO/SS4S] PlayerVideoOpen OK  codec=%s %dx%d@%dfps\n",
             ctx->use_h265 ? "H265" : "H264", width, height, fps);
 
+    if (ctx->use_h265)
+        app_log("[VIDEO] HEVC RPS trim: keep=%d\n", ctx->rps.keep);
     ctx->opened = true;
     return ctx;
 }
@@ -85,6 +91,11 @@ void video_fini(VideoContext *ctx)
 {
     if (!ctx) return;
     if (ctx->opened) SS4S_PlayerVideoClose(ctx->player);
+    if (ctx->rps.keep)
+        app_log("[VIDEO] HEVC RPS trim: rewritten=%llu unchanged=%llu skipped=%llu last=%s\n",
+                (unsigned long long)ctx->rps.rewritten, (unsigned long long)ctx->rps.passed,
+                (unsigned long long)ctx->rps.failed, ctx->rps.last_reason ? ctx->rps.last_reason : "-");
+    hevc_rps_fini(&ctx->rps);
     free(ctx);
 }
 
@@ -122,7 +133,16 @@ bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool fr
                 (unsigned long long)ctx->frame_count, buf_size, is_keyframe ? 1 : 0);
     }
 
-    int rc = SS4S_PlayerVideoFeed(ctx->player, buf, buf_size, flags);
+    const uint8_t *feed = buf;
+    size_t feed_size = buf_size;
+    if (ctx->rps.keep) {
+        uint64_t failed = ctx->rps.failed;
+        hevc_rps_process(&ctx->rps, buf, buf_size, &feed, &feed_size);
+        if (ctx->rps.failed != failed && ctx->rps.failed <= 5)
+            app_log("[VIDEO] HEVC RPS trim skipped an AU: %s\n", ctx->rps.last_reason);
+    }
+
+    int rc = SS4S_PlayerVideoFeed(ctx->player, feed, feed_size, flags);
     if (rc != SS4S_OK) {
         if (ctx->frame_count <= 5)
             app_log("[VIDEO/SS4S] PlayerVideoFeed FAILED rc=%d\n", rc);

@@ -1216,7 +1216,8 @@ int main(int argc, char *argv[])
     }
 
     app_log("[APP] Calling video_init...\n");
-    VideoContext *video_ctx = video_init(ss4s_player, cfg.video_width, cfg.video_height, cfg.video_fps, requested_codec);
+    VideoContext *video_ctx = video_init(ss4s_player, cfg.video_width, cfg.video_height, cfg.video_fps, requested_codec,
+                                         cfg.hevc_rps_keep);
     if (!video_ctx)
     {
         app_log("[APP] video_init failed\n");
