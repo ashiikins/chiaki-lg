@@ -453,6 +453,16 @@ fi
 echo ""
 echo "=== Patching chiaki-ng sources for webOS ==="
 
+# Takion protocol 15/20, as current PS5 Remote Play clients negotiate, with fallback to 12.
+# Made against chiaki-ng 83b29398.
+TAKION_PATCH="$SCRIPT_DIR/patches/chiaki-ng-takion-v20.patch"
+if git -C "$CHIAKI_NG_DIR" apply --reverse --check "$TAKION_PATCH" 2>/dev/null; then
+    echo "-- takion v20: already applied"
+else
+    git -C "$CHIAKI_NG_DIR" apply "$TAKION_PATCH"
+    echo "-- takion v20: applied"
+fi
+
 # webOS SDK sysroot glibc 2.12 has no aligned_alloc (C11, glibc 2.16).
 # The 0.1.2 release binary imports memalign@GLIBC_2.4, so use memalign.
 COMMON_C="$CHIAKI_NG_DIR/lib/src/common.c"
