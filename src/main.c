@@ -127,6 +127,9 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 
 // ── Session callbacks ─────────────────────────────────────────────────────────
 
+// Set while input is initialised; the session callback runs on a chiaki thread.
+static InputContext *g_input_ctx;
+
 static void session_event_cb(ChiakiEvent *event, void *user)
 {
     switch (event->type)
@@ -140,6 +143,10 @@ static void session_event_cb(ChiakiEvent *event, void *user)
             (const uint8_t *)"0000", 4);
         break;
     case CHIAKI_EVENT_RUMBLE:
+        break;
+    case CHIAKI_EVENT_MOTION_RESET:
+        app_log("[APP] Motion reset requested by PS5\n");
+        input_motion_reset(g_input_ctx);
         break;
     case CHIAKI_EVENT_QUIT:
         // Log the reason so we can diagnose what triggered the disconnect.
@@ -1239,6 +1246,7 @@ int main(int argc, char *argv[])
     app_log("[APP] audio_init OK\n");
 
     InputContext *input_ctx = input_init();
+    g_input_ctx = input_ctx;
 
     // ── Build connect info (done once, reused across reconnects) ──────────────
     ChiakiConnectInfo info;
@@ -1614,6 +1622,7 @@ int main(int argc, char *argv[])
     }
 
 cleanup_session_ctx:
+    g_input_ctx = NULL;
     input_fini(input_ctx);
     audio_fini(audio_ctx);
     video_fini(video_ctx);
