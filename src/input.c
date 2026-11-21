@@ -43,6 +43,12 @@
 #define ABS_MT_POSITION_Y  0x36
 #define ABS_MT_TRACKING_ID 0x39
 #endif
+#ifndef INPUT_PROP_ACCELEROMETER
+#define INPUT_PROP_ACCELEROMETER 0x06
+#endif
+#ifndef MSC_TIMESTAMP
+#define MSC_TIMESTAMP 0x05
+#endif
 #ifndef SYN_DROPPED
 #define SYN_DROPPED 3
 #endif
@@ -51,6 +57,8 @@
 #endif
 
 #include <chiaki/controller.h>
+#include <chiaki/orientation.h>
+#include <math.h>
 
 // ── webOS magic key codes (TV remote via SDL_KEYDOWN) ─────────────────────────
 #define WEBOS_KEY_UP        1073741906
@@ -109,6 +117,10 @@ typedef struct {
     char uniq[32];      // shared by a pad's main, Touchpad and Motion Sensors nodes
     TouchSlot slots[TOUCH_SLOTS];
     int  cur_slot;
+    int      motion_res[6];  // Motion Sensors: units per g (ABS_X..Z), per deg/s (ABS_RX..RZ)
+    int      motion_raw[6];
+    uint32_t motion_ts;      // MSC_TIMESTAMP, microseconds
+    bool     motion_have_ts;
     int  abs_min[ABS_CNT];
     int  abs_max[ABS_CNT];
     bool sony_buttons;  // Sony vendor id: BTN_NORTH = triangle, BTN_WEST = square
@@ -116,8 +128,15 @@ typedef struct {
     ChordState chord;
 } GamepadDev;
 
+typedef struct {
+    ChiakiOrientationTracker tracker;
+    ChiakiAccelNewZero       zero;   // accel offset set by a PS5 motion reset
+    ChiakiAccelNewZero       real;   // last real accel sample (in g)
+} MotionState;
+
 struct InputContext {
     ChiakiControllerState state;
+    MotionState           motion;
     pthread_mutex_t       state_mutex;
 
     GamepadDev    pads[MAX_DEVS];
@@ -426,6 +445,57 @@ static bool apply_touch_event(ChiakiControllerState *st, GamepadDev *d,
     return changed;
 }
 
+// ── Motion Sensors node (accel ABS_X..Z, gyro ABS_RX..RZ, MSC_TIMESTAMP) ───────
+// Same conversion as chiaki-ng's evdev path (setsu): accel in g, gyro in rad/s, axes as
+// reported by the driver, orientation from chiaki's Madgwick tracker.
+static void motion_init(MotionState *m)
+{
+    chiaki_orientation_tracker_init(&m->tracker);
+    chiaki_accel_new_zero_set_inactive(&m->zero, false);
+    chiaki_accel_new_zero_set_inactive(&m->real, true);
+}
+
+static uint32_t monotonic_us(void)
+{
+    struct timespec ts;
+    get_monotonic(&ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u);
+}
+
+// Returns true when a complete sample was applied to the controller state.
+static bool apply_motion_event(ChiakiControllerState *st, GamepadDev *d, MotionState *m,
+                               uint16_t type, uint16_t code, int32_t val)
+{
+    if (type == EV_ABS && code <= ABS_RZ) { d->motion_raw[code] = val; return false; }
+    if (type == EV_MSC && code == MSC_TIMESTAMP) { d->motion_ts = (uint32_t)val; d->motion_have_ts = true; return false; }
+    if (type != EV_SYN || code != SYN_REPORT) return false;
+
+    float v[6];
+    for (int i = 0; i < 6; i++) {
+        int res = d->motion_res[i] > 0 ? d->motion_res[i] : (i < 3 ? 8192 : 1024);
+        v[i] = (float)d->motion_raw[i] / (float)res;
+    }
+    const float deg2rad = (float)(M_PI / 180.0);
+    float gx = v[3] * deg2rad, gy = v[4] * deg2rad, gz = v[5] * deg2rad;
+    chiaki_accel_new_zero_set_active(&m->real, v[0], v[1], v[2], true);
+    chiaki_orientation_tracker_update(&m->tracker, gx, gy, gz, v[0], v[1], v[2], &m->zero, false,
+                                      d->motion_have_ts ? d->motion_ts : monotonic_us());
+    chiaki_orientation_tracker_apply_to_controller_state(&m->tracker, st);
+    return true;
+}
+
+// PS5 asked to re-centre motion (CHIAKI_EVENT_MOTION_RESET): the current pose becomes zero.
+static void motion_reset(ChiakiControllerState *st, MotionState *m)
+{
+    chiaki_accel_new_zero_set_active(&m->zero, m->real.accel_x, m->real.accel_y, m->real.accel_z, false);
+    uint32_t ts = m->tracker.timestamp;
+    float gx = st->gyro_x, gy = st->gyro_y, gz = st->gyro_z;
+    chiaki_orientation_tracker_init(&m->tracker);
+    chiaki_orientation_tracker_update(&m->tracker, gx, gy, gz,
+                                      m->real.accel_x, m->real.accel_y, m->real.accel_z, &m->zero, false, ts);
+    chiaki_orientation_tracker_apply_to_controller_state(&m->tracker, st);
+}
+
 // ── Evdev reader thread ────────────────────────────────────────────────────────
 static void *evdev_reader(void *arg)
 {
@@ -475,6 +545,12 @@ static void *evdev_reader(void *arg)
                 app_log("[INPUT] Gamepad %s disconnected\n", ctx->pads[i].path);
                 close(ctx->pads[i].fd);
                 ctx->pads[i].fd = -1;
+                if (ctx->pads[i].kind == DEV_MOTION) {
+                    pthread_mutex_lock(&ctx->state_mutex);
+                    motion_init(&ctx->motion);
+                    chiaki_orientation_tracker_apply_to_controller_state(&ctx->motion.tracker, &ctx->state);
+                    pthread_mutex_unlock(&ctx->state_mutex);
+                }
                 if (ctx->pads[i].kind == DEV_TOUCH) {
                     pthread_mutex_lock(&ctx->state_mutex);
                     touch_release_all(&ctx->state, &ctx->pads[i]);
@@ -493,6 +569,8 @@ static void *evdev_reader(void *arg)
 
             if (ctx->pads[i].kind == DEV_TOUCH)
                 changed = apply_touch_event(&ctx->state, &ctx->pads[i], ev.type, ev.code, ev.value);
+            else if (ctx->pads[i].kind == DEV_MOTION)
+                changed = apply_motion_event(&ctx->state, &ctx->pads[i], &ctx->motion, ev.type, ev.code, ev.value);
             else if (ev.type == EV_KEY) { changed = apply_key_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); }
             else if (ev.type == EV_ABS) { apply_abs_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); changed = true; }
 
@@ -566,6 +644,11 @@ static DevKind companion_kind(int fd, const char *name)
     if (strstr(name, "Touchpad") && EVDEV_BITS_TEST(absbits, ABS_MT_SLOT) &&
         EVDEV_BITS_TEST(absbits, ABS_MT_POSITION_X) && EVDEV_BITS_TEST(keybits, BTN_LEFT))
         return DEV_TOUCH;
+    uint8_t props[(INPUT_PROP_MAX + 7) / 8] = {0};
+    ioctl(fd, EVIOCGPROP(sizeof(props)), props);
+    if (EVDEV_BITS_TEST(props, INPUT_PROP_ACCELEROMETER) && EVDEV_BITS_TEST(absbits, ABS_X) &&
+        EVDEV_BITS_TEST(absbits, ABS_RX) && EVDEV_BITS_TEST(absbits, ABS_RZ))
+        return DEV_MOTION;
     return DEV_PAD; // not a companion we handle
 }
 
@@ -598,6 +681,12 @@ static void open_companions(InputContext *ctx)
                 strcmp(ctx->pads[i].uniq, uniq) == 0)
                 owner = true;
         if (kind == DEV_PAD || !owner) { close(fd); continue; }
+        bool have_motion = false;   // one motion source; several would fight over orientation
+        for (int i = 0; i < ctx->num_pads; i++) have_motion |= ctx->pads[i].kind == DEV_MOTION;
+        if (kind == DEV_MOTION && have_motion) {
+            app_log("[INPUT] Skipping second motion node \"%s\" @ %s\n", name, path);
+            close(fd); continue;
+        }
 
         GamepadDev *d = &ctx->pads[ctx->num_pads];
         for (int axis = 0; axis < ABS_CNT; axis++) {
@@ -605,6 +694,7 @@ static void open_companions(InputContext *ctx)
             if (ioctl(fd, EVIOCGABS(axis), &info) == 0) {
                 d->abs_min[axis] = info.minimum;
                 d->abs_max[axis] = info.maximum;
+                if (axis <= ABS_RZ) d->motion_res[axis] = info.resolution;
             }
         }
         int grab = ioctl(fd, EVIOCGRAB, 1);
@@ -616,6 +706,9 @@ static void open_companions(InputContext *ctx)
         ctx->num_pads++;
         app_log("[INPUT] Opened %s node \"%s\" @ %s (grab %s)\n",
                 kind == DEV_TOUCH ? "touchpad" : "motion", name, path, grab == 0 ? "OK" : strerror(errno));
+        if (kind == DEV_MOTION)
+            app_log("[INPUT] Motion resolution: accel %d/g, gyro %d per deg/s\n",
+                    d->motion_res[ABS_Y], d->motion_res[ABS_RY]);
     }
     closedir(dir);
 }
@@ -728,6 +821,7 @@ InputContext *input_init(void)
     if (!ctx) return NULL;
 
     chiaki_controller_state_set_idle(&ctx->state);
+    motion_init(&ctx->motion);
     pthread_mutex_init(&ctx->state_mutex, NULL);
     ctx->running = true;
     ctx->session = NULL;
@@ -765,6 +859,17 @@ void input_fini(InputContext *ctx)
     }
     pthread_mutex_destroy(&ctx->state_mutex);
     free(ctx);
+}
+
+void input_motion_reset(InputContext *ctx)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->state_mutex);
+    motion_reset(&ctx->state, &ctx->motion);
+    ChiakiControllerState snap = ctx->state;
+    pthread_mutex_unlock(&ctx->state_mutex);
+    if (ctx->session)
+        chiaki_session_set_controller_state(ctx->session, &snap);
 }
 
 // ── TV remote handler (SDL keyboard events only) ───────────────────────────────
