@@ -37,6 +37,15 @@
 #define BTN_DPAD_LEFT  0x222
 #define BTN_DPAD_RIGHT 0x223
 #endif
+#ifndef ABS_MT_SLOT
+#define ABS_MT_SLOT        0x2f
+#define ABS_MT_POSITION_X  0x35
+#define ABS_MT_POSITION_Y  0x36
+#define ABS_MT_TRACKING_ID 0x39
+#endif
+#ifndef SYN_DROPPED
+#define SYN_DROPPED 3
+#endif
 #ifndef BTN_RECORD
 #define BTN_RECORD     0x167   /* Xbox Series X|S capture/share button */
 #endif
@@ -60,7 +69,13 @@
     (((arr)[(bit) / 8]) & (1 << ((bit) % 8)))
 
 // ── Per-device state ───────────────────────────────────────────────────────────
-#define MAX_GAMEPADS 4
+#define MAX_GAMEPADS 4                  // main gamepad nodes
+#define MAX_DEVS     (MAX_GAMEPADS * 3) // plus DualSense/DS4 Touchpad and Motion Sensors nodes
+#define TOUCH_SLOTS  2                  // DualSense/DS4 touchpads report 2 contacts
+
+// Range of chiaki's touch coordinates (same as chiaki-ng's PS_TOUCHPAD_MAXX/Y)
+#define PS_TOUCHPAD_MAXX 1920
+#define PS_TOUCHPAD_MAXY 1079
 
 // ── Touchpad chord: Select+Start → Touchpad (for Xbox controllers) ──────────
 // When Select or Start is pressed alone, we defer emitting SHARE/OPTIONS for
@@ -78,9 +93,22 @@ typedef struct {
     uint32_t        tap_pending;    // chiaki button bit needing immediate release after tap
 } ChordState;
 
+typedef enum { DEV_PAD, DEV_TOUCH, DEV_MOTION } DevKind;
+
+typedef struct {
+    int      tracking_id;  // -1 = no contact
+    uint16_t x, y;
+    int8_t   chiaki_id;    // id from chiaki_controller_state_start_touch, -1 = none
+    bool     dirty;
+} TouchSlot;
+
 typedef struct {
     int  fd;
     char path[64];
+    DevKind kind;
+    char uniq[32];      // shared by a pad's main, Touchpad and Motion Sensors nodes
+    TouchSlot slots[TOUCH_SLOTS];
+    int  cur_slot;
     int  abs_min[ABS_CNT];
     int  abs_max[ABS_CNT];
     bool sony_buttons;  // Sony vendor id: BTN_NORTH = triangle, BTN_WEST = square
@@ -92,8 +120,8 @@ struct InputContext {
     ChiakiControllerState state;
     pthread_mutex_t       state_mutex;
 
-    GamepadDev    pads[MAX_GAMEPADS];
-    int           num_pads;
+    GamepadDev    pads[MAX_DEVS];
+    int           num_pads;       // all opened nodes (gamepads and companions)
 
     pthread_t     reader_thread;
     volatile bool running;
@@ -317,6 +345,87 @@ static void apply_abs_event(ChiakiControllerState *st, GamepadDev *pad,
     }
 }
 
+// ── Touchpad node (hid-playstation / hid-sony "... Touchpad", MT protocol B) ───
+static void touch_slots_init(GamepadDev *d)
+{
+    for (int i = 0; i < TOUCH_SLOTS; i++)
+        d->slots[i] = (TouchSlot){ .tracking_id = -1, .chiaki_id = -1 };
+    d->cur_slot = 0;
+}
+
+// Lift every contact of this touchpad. Returns true if any was down.
+static bool touch_release_all(ChiakiControllerState *st, GamepadDev *d)
+{
+    bool any = false;
+    for (int i = 0; i < TOUCH_SLOTS; i++) {
+        if (d->slots[i].chiaki_id >= 0) {
+            chiaki_controller_state_stop_touch(st, (uint8_t)d->slots[i].chiaki_id);
+            any = true;
+        }
+        d->slots[i] = (TouchSlot){ .tracking_id = -1, .chiaki_id = -1 };
+    }
+    return any;
+}
+
+static uint16_t touch_scale(int v, int min, int max, int out_max)
+{
+    if (max <= min) return 0;
+    if (v < min) v = min;
+    if (v > max) v = max;
+    return (uint16_t)(((int64_t)(v - min) * out_max) / (max - min));
+}
+
+// Returns true when the controller state changed and should be sent.
+// Contacts are applied on SYN_REPORT, when slot, id and position are complete.
+static bool apply_touch_event(ChiakiControllerState *st, GamepadDev *d,
+                              uint16_t type, uint16_t code, int32_t val)
+{
+    if (type == EV_KEY && code == BTN_LEFT) {          // touchpad click
+        if (val) st->buttons |= CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
+        else     st->buttons &= ~CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
+        return true;
+    }
+    if (type == EV_ABS) {
+        if (code == ABS_MT_SLOT) { d->cur_slot = (val >= 0 && val < TOUCH_SLOTS) ? val : -1; return false; }
+        if (d->cur_slot < 0) return false;
+        TouchSlot *t = &d->slots[d->cur_slot];
+        switch (code) {
+        case ABS_MT_TRACKING_ID: t->tracking_id = val; t->dirty = true; break;
+        case ABS_MT_POSITION_X:
+            t->x = touch_scale(val, d->abs_min[ABS_MT_POSITION_X], d->abs_max[ABS_MT_POSITION_X], PS_TOUCHPAD_MAXX);
+            t->dirty = true; break;
+        case ABS_MT_POSITION_Y:
+            t->y = touch_scale(val, d->abs_min[ABS_MT_POSITION_Y], d->abs_max[ABS_MT_POSITION_Y], PS_TOUCHPAD_MAXY);
+            t->dirty = true; break;
+        default: break;
+        }
+        return false;
+    }
+    if (type == EV_SYN && code == SYN_DROPPED)
+        return touch_release_all(st, d);
+    if (type != EV_SYN || code != SYN_REPORT)
+        return false;
+
+    bool changed = false;
+    for (int i = 0; i < TOUCH_SLOTS; i++) {
+        TouchSlot *t = &d->slots[i];
+        if (!t->dirty) continue;
+        t->dirty = false;
+        if (t->tracking_id >= 0 && t->chiaki_id < 0) {
+            t->chiaki_id = chiaki_controller_state_start_touch(st, t->x, t->y);
+            changed |= t->chiaki_id >= 0;
+        } else if (t->tracking_id >= 0) {
+            chiaki_controller_state_set_touch_pos(st, (uint8_t)t->chiaki_id, t->x, t->y);
+            changed = true;
+        } else if (t->chiaki_id >= 0) {
+            chiaki_controller_state_stop_touch(st, (uint8_t)t->chiaki_id);
+            t->chiaki_id = -1;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 // ── Evdev reader thread ────────────────────────────────────────────────────────
 static void *evdev_reader(void *arg)
 {
@@ -366,6 +475,15 @@ static void *evdev_reader(void *arg)
                 app_log("[INPUT] Gamepad %s disconnected\n", ctx->pads[i].path);
                 close(ctx->pads[i].fd);
                 ctx->pads[i].fd = -1;
+                if (ctx->pads[i].kind == DEV_TOUCH) {
+                    pthread_mutex_lock(&ctx->state_mutex);
+                    touch_release_all(&ctx->state, &ctx->pads[i]);
+                    ctx->state.buttons &= ~CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
+                    ChiakiControllerState snap = ctx->state;
+                    pthread_mutex_unlock(&ctx->state_mutex);
+                    if (ctx->session)
+                        chiaki_session_set_controller_state(ctx->session, &snap);
+                }
                 continue;
             }
             if (n != sizeof(ev)) continue;
@@ -373,7 +491,9 @@ static void *evdev_reader(void *arg)
             bool changed = false;
             pthread_mutex_lock(&ctx->state_mutex);
 
-            if      (ev.type == EV_KEY) { changed = apply_key_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); }
+            if (ctx->pads[i].kind == DEV_TOUCH)
+                changed = apply_touch_event(&ctx->state, &ctx->pads[i], ev.type, ev.code, ev.value);
+            else if (ev.type == EV_KEY) { changed = apply_key_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); }
             else if (ev.type == EV_ABS) { apply_abs_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); changed = true; }
 
             ChiakiControllerState snap = ctx->state;
@@ -433,14 +553,82 @@ static bool is_gamepad(int fd, const char *name)
     return true;
 }
 
+// ── Companion nodes of Sony pads (Touchpad, Motion Sensors) ───────────────────
+// hid-playstation and hid-sony split one controller into several evdev nodes that
+// share the controller's Bluetooth address as uniq. Only nodes whose uniq matches an
+// opened Sony gamepad are taken, so other touchpads and sensors stay with the system.
+static DevKind companion_kind(int fd, const char *name)
+{
+    uint8_t absbits[(ABS_MAX + 7) / 8] = {0};
+    uint8_t keybits[(KEY_MAX + 7) / 8] = {0};
+    ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
+    ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits);
+    if (strstr(name, "Touchpad") && EVDEV_BITS_TEST(absbits, ABS_MT_SLOT) &&
+        EVDEV_BITS_TEST(absbits, ABS_MT_POSITION_X) && EVDEV_BITS_TEST(keybits, BTN_LEFT))
+        return DEV_TOUCH;
+    return DEV_PAD; // not a companion we handle
+}
+
+static bool path_open(InputContext *ctx, const char *path)
+{
+    for (int i = 0; i < ctx->num_pads; i++)
+        if (strcmp(ctx->pads[i].path, path) == 0) return true;
+    return false;
+}
+
+static void open_companions(InputContext *ctx)
+{
+    DIR *dir = opendir("/dev/input");
+    if (!dir) return;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && ctx->num_pads < MAX_DEVS) {
+        if (strncmp(ent->d_name, "event", 5) != 0) continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+        if (path_open(ctx, path)) continue;
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) continue;
+        char name[256] = {0}, uniq[32] = {0};
+        ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
+        ioctl(fd, EVIOCGUNIQ(sizeof(uniq) - 1), uniq);
+        DevKind kind = companion_kind(fd, name);
+        bool owner = false;
+        for (int i = 0; i < ctx->num_pads && kind != DEV_PAD; i++)
+            if (ctx->pads[i].kind == DEV_PAD && ctx->pads[i].sony_buttons && uniq[0] &&
+                strcmp(ctx->pads[i].uniq, uniq) == 0)
+                owner = true;
+        if (kind == DEV_PAD || !owner) { close(fd); continue; }
+
+        GamepadDev *d = &ctx->pads[ctx->num_pads];
+        for (int axis = 0; axis < ABS_CNT; axis++) {
+            struct input_absinfo info;
+            if (ioctl(fd, EVIOCGABS(axis), &info) == 0) {
+                d->abs_min[axis] = info.minimum;
+                d->abs_max[axis] = info.maximum;
+            }
+        }
+        int grab = ioctl(fd, EVIOCGRAB, 1);
+        d->kind = kind;
+        snprintf(d->path, sizeof(d->path), "%s", path);
+        snprintf(d->uniq, sizeof(d->uniq), "%s", uniq);
+        touch_slots_init(d);
+        d->fd = fd;
+        ctx->num_pads++;
+        app_log("[INPUT] Opened %s node \"%s\" @ %s (grab %s)\n",
+                kind == DEV_TOUCH ? "touchpad" : "motion", name, path, grab == 0 ? "OK" : strerror(errno));
+    }
+    closedir(dir);
+}
+
 // ── Open and exclusively grab all physical gamepads ───────────────────────────
 static void open_gamepads(InputContext *ctx)
 {
     ctx->num_pads = 0;
-    for (int i = 0; i < MAX_GAMEPADS; i++) {
+    int num_main = 0;
+    for (int i = 0; i < MAX_DEVS; i++) {
+        memset(&ctx->pads[i], 0, sizeof(ctx->pads[i]));
         ctx->pads[i].fd = -1;
-        ctx->pads[i].path[0] = '\0';
-        memset(&ctx->pads[i].chord, 0, sizeof(ChordState));
+        touch_slots_init(&ctx->pads[i]);
     }
 
     DIR *dir = opendir("/dev/input");
@@ -450,7 +638,7 @@ static void open_gamepads(InputContext *ctx)
     }
 
     struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL && ctx->num_pads < MAX_GAMEPADS) {
+    while ((ent = readdir(dir)) != NULL && num_main < MAX_GAMEPADS) {
         if (strncmp(ent->d_name, "event", 5) != 0) continue;
 
         char path[64];
@@ -512,11 +700,16 @@ static void open_gamepads(InputContext *ctx)
                 pad->z_triggers ? "ABS_Z/RZ" : "ABS_GAS/BRAKE");
 
         snprintf(pad->path, sizeof(pad->path), "%s", path);
+        pad->kind = DEV_PAD;
+        ioctl(fd, EVIOCGUNIQ(sizeof(pad->uniq) - 1), pad->uniq);
         pad->fd = fd;
         ctx->num_pads++;
+        num_main++;
         app_log("[INPUT] Opened gamepad: \"%s\" @ %s\n", devname, path);
     }
     closedir(dir);
+
+    open_companions(ctx);
 
     if (ctx->num_pads == 0)
         app_log("[INPUT] No physical gamepads found — TV remote only\n");
@@ -547,7 +740,16 @@ InputContext *input_init(void)
 
 void input_set_session(InputContext *ctx, ChiakiSession *session)
 {
-    if (ctx) ctx->session = session;
+    if (!ctx) return;
+    if (!session) {
+        // Session over: no contact may stay down into the next session.
+        pthread_mutex_lock(&ctx->state_mutex);
+        for (int i = 0; i < ctx->num_pads; i++)
+            if (ctx->pads[i].kind == DEV_TOUCH)
+                touch_release_all(&ctx->state, &ctx->pads[i]);
+        pthread_mutex_unlock(&ctx->state_mutex);
+    }
+    ctx->session = session;
 }
 
 void input_fini(InputContext *ctx)
