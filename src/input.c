@@ -168,6 +168,7 @@ struct InputContext {
     volatile bool         mic_stream;
     InputMicHandler       mic;
     uint32_t              hid_mic_frames, hid_state_reports;
+    uint32_t              hid_log_us;   // last pad-state log line while the mic streams
 
     GamepadDev    pads[MAX_DEVS];
     int           num_pads;       // all opened nodes (gamepads and companions)
@@ -594,6 +595,13 @@ static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
         apply_ds5_input(&ctx->state, pad, &ctx->motion, &in);
         ChiakiControllerState snap = ctx->state;
         pthread_mutex_unlock(&ctx->state_mutex);
+        uint32_t t = monotonic_us();
+        if ((uint32_t)(t - ctx->hid_log_us) >= 5000000u) {
+            ctx->hid_log_us = t;
+            app_log("[INPUT] hidraw pad: buttons=%#x L2=%u R2=%u sticks %d,%d %d,%d (reports %u state, %u mic)\n",
+                    snap.buttons, snap.l2_state, snap.r2_state, snap.left_x, snap.left_y,
+                    snap.right_x, snap.right_y, ctx->hid_state_reports, ctx->hid_mic_frames);
+        }
         if (ctx->session)
             chiaki_session_set_controller_state(ctx->session, &snap);
     }
