@@ -1319,10 +1319,11 @@ int main(int argc, char *argv[])
     info.video_profile.codec = requested_codec;
 
     // DualSense mode only with a DualSense whose output reports work: the PS5 then sends
-    // haptics as audio (turned into rumble) instead of rumble events.
+    // haptics as audio instead of rumble events.
     info.enable_dualsense = cfg.enable_dualsense && input_has_dualsense_output(input_ctx);
     app_log("[APP] DualSense mode: %s\n", info.enable_dualsense ? "on" :
             cfg.enable_dualsense ? "off (no DualSense with Bluetooth output)" : "off (config)");
+    input_set_bt_haptics(input_ctx, info.enable_dualsense && cfg.dualsense_haptics);
     if (info.enable_dualsense && cfg.dualsense_mic)
         g_mic = mic_new(input_ctx, &chiaki_log, cfg.dualsense_mic_unmuted);
     app_log("[APP] DualSense mic: %s\n", g_mic ? "on (mic button unmutes)" :

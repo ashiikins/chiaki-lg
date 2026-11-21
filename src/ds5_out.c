@@ -92,6 +92,34 @@ void ds5_mic_control_report(uint8_t out[DS5_MIC_CONTROL_SIZE], uint8_t seq, bool
     ds5_put_crc(out, DS5_MIC_CONTROL_SIZE);
 }
 
+void ds5_haptics_report(uint8_t out[DS5_MIC_CONTROL_SIZE], uint8_t seq, uint8_t flags, uint8_t ctrl_buffer,
+                        uint8_t counter, const int8_t *samples, size_t len)
+{
+    memset(out, 0, DS5_MIC_CONTROL_SIZE);
+    if (len > 2 * DS5_HAPTICS_BLOCK) len = 2 * DS5_HAPTICS_BLOCK;
+    out[0] = 0x32;
+    out[1] = (uint8_t)((seq & 0x0f) << 4);
+    out[2] = 0x91;
+    out[3] = 4;
+    out[4] = flags;
+    out[5] = ctrl_buffer;
+    out[6] = ctrl_buffer;
+    out[7] = counter;
+    out[8] = (uint8_t)(0x92 | (len > DS5_HAPTICS_BLOCK ? 0x40 : 0));
+    out[9] = DS5_HAPTICS_BLOCK;
+    if (samples && len) memcpy(&out[10], samples, len);
+    ds5_put_crc(out, DS5_MIC_CONTROL_SIZE);
+}
+
+void ds5_set_haptics_mode(uint8_t common[DS5_COMMON_SIZE])
+{
+    common[DS5_FLAG0] = (uint8_t)((common[DS5_FLAG0] & ~DS5_FLAG0_HAPTICS_SELECT) | DS5_FLAG0_COMPAT_VIBRATION);
+    common[DS5_FLAG1] |= 0x40;
+    common[DS5_MOTOR_LEFT] = 0;
+    common[DS5_MOTOR_RIGHT] = 0;
+    common[DS5_FLAG2] &= (uint8_t)~0x0c;
+}
+
 void ds5_bt_report(uint8_t out[DS5_BT_REPORT_SIZE], uint8_t seq, const uint8_t common[DS5_COMMON_SIZE])
 {
     memset(out, 0, DS5_BT_REPORT_SIZE);
