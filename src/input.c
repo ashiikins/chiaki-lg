@@ -1,9 +1,11 @@
 #include "input.h"
+#include "ds5_out.h"
 #include "app_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -15,6 +17,7 @@
 #include <sys/select.h>
 #include <time.h>
 #include <linux/input.h>
+#include <linux/hidraw.h>
 
 // ── Fallback defines for old kernel headers (pre-3.16 webOS sysroot) ──────────
 // These gamepad layout aliases were added in Linux 3.16.
@@ -117,6 +120,7 @@ typedef struct {
     char uniq[32];      // shared by a pad's main, Touchpad and Motion Sensors nodes
     TouchSlot slots[TOUCH_SLOTS];
     int  cur_slot;
+    int      hid_fd;         // DualSense hidraw for output reports, -1 = none (out_mutex)
     int      ff_id;          // uploaded FF_RUMBLE effect id, -1 = none
     bool     ff_rumble;      // Sony pad opened read-write with FF_RUMBLE support
     int      motion_res[6];  // Motion Sensors: units per g (ABS_X..Z), per deg/s (ABS_RX..RZ)
@@ -139,6 +143,11 @@ typedef struct {
 struct InputContext {
     ChiakiControllerState state;
     MotionState           motion;
+    pthread_mutex_t       out_mutex;     // hidraw fds, sequence, last trigger state
+    uint8_t               out_seq;
+    unsigned              out_logged;    // one log line per report kind
+    bool                  trig_valid;
+    uint8_t               trig_last[22];
     pthread_mutex_t       state_mutex;
 
     GamepadDev    pads[MAX_DEVS];
@@ -550,6 +559,9 @@ static void *evdev_reader(void *arg)
                 ctx->pads[i].fd = -1;
                 ctx->pads[i].ff_rumble = false;
                 pthread_mutex_unlock(&ctx->state_mutex);
+                pthread_mutex_lock(&ctx->out_mutex);
+                if (ctx->pads[i].hid_fd >= 0) { close(ctx->pads[i].hid_fd); ctx->pads[i].hid_fd = -1; }
+                pthread_mutex_unlock(&ctx->out_mutex);
                 if (ctx->pads[i].kind == DEV_MOTION) {
                     pthread_mutex_lock(&ctx->state_mutex);
                     motion_init(&ctx->motion);
@@ -719,6 +731,43 @@ static void open_companions(InputContext *ctx)
     closedir(dir);
 }
 
+// Open the DualSense's hidraw node for output reports (lightbar, player LEDs,
+// adaptive triggers). The app jail has /dev/hidraw* but no /sys/class/hidraw, so
+// match by ioctl: DualSense product and HID phys equal to the evdev uniq
+// (Bluetooth address; case differs). Only Bluetooth is handled (report 0x31).
+static int open_ds5_hidraw(const char *uniq)
+{
+    DIR *dir = opendir("/dev");
+    if (!dir) { app_log("[INPUT] hidraw: opendir(/dev) failed: %s\n", strerror(errno)); return -1; }
+    struct dirent *ent;
+    int seen = 0, found = -1;
+    while (found < 0 && (ent = readdir(dir)) != NULL) {
+        if (strncmp(ent->d_name, "hidraw", 6) != 0) continue;
+        char p[64];
+        snprintf(p, sizeof(p), "/dev/%s", ent->d_name);
+        seen++;
+        int fd = open(p, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) { app_log("[INPUT] hidraw %s: open read-write failed: %s\n", p, strerror(errno)); continue; }
+        struct hidraw_devinfo info;
+        char phys[64] = {0};
+        bool ds5 = ioctl(fd, HIDIOCGRAWINFO, &info) == 0 &&
+                   ds5_is_dualsense((uint16_t)info.vendor, (uint16_t)info.product);
+        ioctl(fd, HIDIOCGRAWPHYS(sizeof(phys) - 1), phys);
+        if (!ds5 || !uniq[0] || strcasecmp(phys, uniq) != 0) { close(fd); continue; }
+        if (info.bustype != BUS_BLUETOOTH) {
+            app_log("[INPUT] hidraw %s: DualSense on bus %u, not Bluetooth; output reports off\n", p, info.bustype);
+            close(fd); break;
+        }
+        app_log("[INPUT] hidraw %s for %s: open read-write OK; output reports on\n", p, uniq);
+        found = fd;
+    }
+    closedir(dir);
+    if (found < 0) app_log("[INPUT] hidraw for %s: no usable node (%d hidraw nodes seen)\n", uniq, seen);
+    return found;
+}
+
+static void ds5_triggers_off(InputContext *ctx);
+
 // ── Open and exclusively grab all physical gamepads ───────────────────────────
 static void open_gamepads(InputContext *ctx)
 {
@@ -727,6 +776,7 @@ static void open_gamepads(InputContext *ctx)
     for (int i = 0; i < MAX_DEVS; i++) {
         memset(&ctx->pads[i], 0, sizeof(ctx->pads[i]));
         ctx->pads[i].fd = -1;
+        ctx->pads[i].hid_fd = -1;
         touch_slots_init(&ctx->pads[i]);
     }
 
@@ -823,6 +873,7 @@ static void open_gamepads(InputContext *ctx)
         snprintf(pad->path, sizeof(pad->path), "%s", path);
         pad->kind = DEV_PAD;
         ioctl(fd, EVIOCGUNIQ(sizeof(pad->uniq) - 1), pad->uniq);
+        pad->hid_fd = ds5_is_dualsense(id.vendor, id.product) ? open_ds5_hidraw(pad->uniq) : -1;
         pad->fd = fd;
         ctx->num_pads++;
         num_main++;
@@ -851,10 +902,12 @@ InputContext *input_init(void)
     chiaki_controller_state_set_idle(&ctx->state);
     motion_init(&ctx->motion);
     pthread_mutex_init(&ctx->state_mutex, NULL);
+    pthread_mutex_init(&ctx->out_mutex, NULL);
     ctx->running = true;
     ctx->session = NULL;
 
     open_gamepads(ctx);
+    ds5_triggers_off(ctx);
 
     pthread_create(&ctx->reader_thread, NULL, evdev_reader, ctx);
     return ctx;
@@ -902,11 +955,97 @@ void input_set_rumble(InputContext *ctx, uint8_t left, uint8_t right)
     pthread_mutex_unlock(&ctx->state_mutex);
 }
 
+// ── DualSense output reports (hidraw, Bluetooth report 0x31) ──────────────────
+enum { OUT_LIGHTBAR = 1, OUT_PLAYER = 2, OUT_TRIGGERS = 4, OUT_TRIGGERS_OFF = 8 };
+
+// Caller holds out_mutex.
+static void ds5_send_locked(InputContext *ctx, const uint8_t common[DS5_COMMON_SIZE], unsigned kind)
+{
+    for (int i = 0; i < ctx->num_pads; i++) {
+        GamepadDev *d = &ctx->pads[i];
+        if (d->hid_fd < 0) continue;
+        uint8_t rep[DS5_BT_REPORT_SIZE];
+        ds5_bt_report(rep, ctx->out_seq++, common);
+        ssize_t w = write(d->hid_fd, rep, sizeof(rep));
+        if (w != (ssize_t)sizeof(rep)) {
+            app_log("[INPUT] DualSense output report failed on %s: %zd (%s); output reports off\n",
+                    d->path, w, w < 0 ? strerror(errno) : "short write");
+            close(d->hid_fd);
+            d->hid_fd = -1;
+        } else if (!(ctx->out_logged & kind)) {
+            ctx->out_logged |= kind;
+            app_log("[INPUT] DualSense output report (kind %u) written to %s\n", kind, d->path);
+        }
+    }
+}
+
+static void ds5_send(InputContext *ctx, const uint8_t common[DS5_COMMON_SIZE], unsigned kind)
+{
+    pthread_mutex_lock(&ctx->out_mutex);
+    ds5_send_locked(ctx, common, kind);
+    pthread_mutex_unlock(&ctx->out_mutex);
+}
+
+void input_set_lightbar(InputContext *ctx, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!ctx) return;
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_lightbar(c, r, g, b);
+    ds5_send(ctx, c, OUT_LIGHTBAR);
+}
+
+void input_set_player_index(InputContext *ctx, int player_index)
+{
+    if (!ctx) return;
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_player_lights(c, player_index);
+    ds5_send(ctx, c, OUT_PLAYER);
+}
+
+void input_set_triggers(InputContext *ctx, uint8_t type_left, const uint8_t left[10],
+                        uint8_t type_right, const uint8_t right[10])
+{
+    if (!ctx) return;
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_triggers(c, type_left, left, type_right, right);
+    pthread_mutex_lock(&ctx->out_mutex);
+    if (!ctx->trig_valid || memcmp(ctx->trig_last, &c[DS5_TRIGGER_RIGHT], sizeof(ctx->trig_last)) != 0) {
+        memcpy(ctx->trig_last, &c[DS5_TRIGGER_RIGHT], sizeof(ctx->trig_last));
+        ctx->trig_valid = true;
+        ds5_send_locked(ctx, c, OUT_TRIGGERS);
+    }
+    pthread_mutex_unlock(&ctx->out_mutex);
+}
+
+// Release adaptive-trigger resistance. Sent when hidraw opens (clears what a killed
+// earlier run left), when a session ends and on exit; SIGKILL cannot be covered.
+static void ds5_triggers_off(InputContext *ctx)
+{
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_triggers_off(c);
+    pthread_mutex_lock(&ctx->out_mutex);
+    memcpy(ctx->trig_last, &c[DS5_TRIGGER_RIGHT], sizeof(ctx->trig_last));
+    ctx->trig_valid = true;
+    ds5_send_locked(ctx, c, OUT_TRIGGERS_OFF);
+    pthread_mutex_unlock(&ctx->out_mutex);
+}
+
+bool input_has_dualsense_output(InputContext *ctx)
+{
+    if (!ctx) return false;
+    bool any = false;
+    pthread_mutex_lock(&ctx->out_mutex);
+    for (int i = 0; i < ctx->num_pads; i++) any |= ctx->pads[i].hid_fd >= 0;
+    pthread_mutex_unlock(&ctx->out_mutex);
+    return any;
+}
+
 void input_set_session(InputContext *ctx, ChiakiSession *session)
 {
     if (!ctx) return;
     if (!session) {
         input_set_rumble(ctx, 0, 0);
+        ds5_triggers_off(ctx);
         // Session over: no contact may stay down into the next session.
         pthread_mutex_lock(&ctx->state_mutex);
         for (int i = 0; i < ctx->num_pads; i++)
@@ -923,13 +1062,16 @@ void input_fini(InputContext *ctx)
     ctx->running = false;
     pthread_join(ctx->reader_thread, NULL);
     input_set_rumble(ctx, 0, 0);
+    ds5_triggers_off(ctx);
     for (int i = 0; i < ctx->num_pads; i++) {
         if (ctx->pads[i].fd >= 0) {
             ioctl(ctx->pads[i].fd, EVIOCGRAB, 0);
             close(ctx->pads[i].fd);
         }
+        if (ctx->pads[i].hid_fd >= 0) close(ctx->pads[i].hid_fd);
     }
     pthread_mutex_destroy(&ctx->state_mutex);
+    pthread_mutex_destroy(&ctx->out_mutex);
     free(ctx);
 }
 

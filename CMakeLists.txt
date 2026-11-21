@@ -131,6 +131,7 @@ add_executable(chiaki-webos
     src/hevc_rps.c
     src/audio.c
     src/input.c
+    src/ds5_out.c
     src/ui.c
     src/stats.c
 )

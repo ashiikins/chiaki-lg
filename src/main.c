@@ -129,6 +129,7 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 
 // Set while input is initialised; the session callback runs on a chiaki thread.
 static InputContext *g_input_ctx;
+static unsigned g_ds_events_logged;   // one log line per DualSense event type
 
 static void session_event_cb(ChiakiEvent *event, void *user)
 {
@@ -144,6 +145,24 @@ static void session_event_cb(ChiakiEvent *event, void *user)
         break;
     case CHIAKI_EVENT_RUMBLE:
         input_set_rumble(g_input_ctx, event->rumble.left, event->rumble.right);
+        break;
+    case CHIAKI_EVENT_LED_COLOR:
+        if (!(g_ds_events_logged & 1)) { g_ds_events_logged |= 1;
+            app_log("[APP] First LED colour event: %u,%u,%u\n",
+                    event->led_state[0], event->led_state[1], event->led_state[2]); }
+        input_set_lightbar(g_input_ctx, event->led_state[0], event->led_state[1], event->led_state[2]);
+        break;
+    case CHIAKI_EVENT_PLAYER_INDEX:
+        if (!(g_ds_events_logged & 2)) { g_ds_events_logged |= 2;
+            app_log("[APP] First player index event: %u\n", event->player_index); }
+        input_set_player_index(g_input_ctx, event->player_index);
+        break;
+    case CHIAKI_EVENT_TRIGGER_EFFECTS:
+        if (!(g_ds_events_logged & 4)) { g_ds_events_logged |= 4;
+            app_log("[APP] First trigger effect event: left type 0x%02x, right type 0x%02x\n",
+                    event->trigger_effects.type_left, event->trigger_effects.type_right); }
+        input_set_triggers(g_input_ctx, event->trigger_effects.type_left, event->trigger_effects.left,
+                           event->trigger_effects.type_right, event->trigger_effects.right);
         break;
     case CHIAKI_EVENT_MOTION_RESET:
         app_log("[APP] Motion reset requested by PS5\n");
