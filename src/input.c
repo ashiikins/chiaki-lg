@@ -83,6 +83,7 @@ typedef struct {
     char path[64];
     int  abs_min[ABS_CNT];
     int  abs_max[ABS_CNT];
+    bool sony_buttons;  // Sony vendor id: BTN_NORTH = triangle, BTN_WEST = square
     bool z_triggers;    // ABS_Z/ABS_RZ are L2/R2 (hid-playstation, hid-sony), not a right stick
     ChordState chord;
 } GamepadDev;
@@ -219,8 +220,12 @@ static bool apply_key_event(ChiakiControllerState *st, GamepadDev *pad,
     switch (code) {
     case BTN_SOUTH:      btn = CHIAKI_CONTROLLER_BUTTON_CROSS;    break;
     case BTN_EAST:       btn = CHIAKI_CONTROLLER_BUTTON_MOON;     break;
-    case BTN_NORTH:      btn = CHIAKI_CONTROLLER_BUTTON_BOX;      break;
-    case BTN_WEST:       btn = CHIAKI_CONTROLLER_BUTTON_PYRAMID;  break;
+    // xpad reports the left face button (X) as BTN_NORTH and the top one (Y) as BTN_WEST.
+    // hid-playstation/hid-sony report triangle (top) as BTN_NORTH and square (left) as BTN_WEST.
+    case BTN_NORTH:      btn = pad->sony_buttons ? CHIAKI_CONTROLLER_BUTTON_PYRAMID
+                                                : CHIAKI_CONTROLLER_BUTTON_BOX;     break;
+    case BTN_WEST:       btn = pad->sony_buttons ? CHIAKI_CONTROLLER_BUTTON_BOX
+                                                : CHIAKI_CONTROLLER_BUTTON_PYRAMID; break;
     case BTN_TL:         btn = CHIAKI_CONTROLLER_BUTTON_L1;       break;
     case BTN_TR:         btn = CHIAKI_CONTROLLER_BUTTON_R1;       break;
     case BTN_TL2: /* fall-through */ case BTN_TR2: return false;
@@ -481,7 +486,8 @@ static void open_gamepads(InputContext *ctx)
 
         struct input_id id;
         memset(&id, 0, sizeof(id));
-        pad->z_triggers = ioctl(fd, EVIOCGID, &id) == 0 && id.vendor == 0x054c;
+        pad->sony_buttons = ioctl(fd, EVIOCGID, &id) == 0 && id.vendor == 0x054c;
+        pad->z_triggers = pad->sony_buttons;
         if (!pad->z_triggers) {
             // Fallback: right stick on RX/RY and ABS_Z/RZ resting at their minimum with no
             // dead zone means Z/RZ are triggers, not a second stick.
@@ -492,8 +498,9 @@ static void open_gamepads(InputContext *ctx)
                 z.flat == 0 && rz.flat == 0 && z.value == z.minimum && rz.value == rz.minimum)
                 pad->z_triggers = true;
         }
-        app_log("[INPUT] \"%s\" vendor=%04x product=%04x triggers=%s\n", devname,
-                id.vendor, id.product, pad->z_triggers ? "ABS_Z/RZ" : "ABS_GAS/BRAKE");
+        app_log("[INPUT] \"%s\" vendor=%04x product=%04x buttons=%s triggers=%s\n", devname,
+                id.vendor, id.product, pad->sony_buttons ? "sony" : "xpad",
+                pad->z_triggers ? "ABS_Z/RZ" : "ABS_GAS/BRAKE");
 
         snprintf(pad->path, sizeof(pad->path), "%s", path);
         pad->fd = fd;
