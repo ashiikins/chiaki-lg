@@ -1,5 +1,6 @@
 #include "input.h"
 #include "ds5_out.h"
+#include "ds5_in.h"
 #include "app_log.h"
 
 #include <stdio.h>
@@ -122,6 +123,12 @@ typedef struct {
     int  cur_slot;
     int      hid_fd;         // DualSense hidraw for output reports, -1 = none (out_mutex)
     bool     ds5_enhanced;   // firmware 2.24+ rumble mode (or firmware unknown)
+    Ds5Calib calib;          // IMU calibration for state read from hidraw
+    bool     mute_prev;      // mic mute button was down in the last state report
+    bool     kern_mute_prev; // mic mute bit in the last 0x31 report of any kind (kernel's view)
+    bool     mic_fix_due;    // send the unmute write with the next report (after the kernel's write)
+    bool     kern_muted;     // estimate of hid-playstation's mic_muted toggle (relearned from status)
+    uint32_t hid_buttons;    // buttons this pad set from hidraw
     int      ff_id;          // uploaded FF_RUMBLE effect id, -1 = none
     bool     ff_rumble;      // Sony pad opened read-write with FF_RUMBLE support
     int      motion_res[6];  // Motion Sensors: units per g (ABS_X..Z), per deg/s (ABS_RX..RZ)
@@ -135,8 +142,13 @@ typedef struct {
     ChordState chord;
 } GamepadDev;
 
+// Time base of the tracker's timestamps: MSC_TIMESTAMP counts the pad's own clock, hidraw
+// samples are stamped with the host's. The two share no origin.
+typedef enum { MOTION_CLOCK_NONE, MOTION_CLOCK_PAD, MOTION_CLOCK_HOST } MotionClock;
+
 typedef struct {
     ChiakiOrientationTracker tracker;
+    MotionClock              clock;
     ChiakiAccelNewZero       zero;   // accel offset set by a PS5 motion reset
     ChiakiAccelNewZero       real;   // last real accel sample (in g)
 } MotionState;
@@ -158,6 +170,25 @@ struct InputContext {
     struct timespec       hap_last;      // last frame received
     uint8_t               trig_last[22];
     pthread_mutex_t       state_mutex;
+
+    // Mic stream: while the DualSense sends mic frames, the pad state comes from hidraw
+    // and the kernel's evdev nodes of that pad are ignored (they carry phantom input).
+    volatile bool         mic_stream;
+    InputMicHandler       mic;
+    uint32_t              hid_mic_frames, hid_state_reports;
+    uint32_t              last_mic_us;     // time of the last mic frame
+    bool                  hid_owned;       // pad state currently read from hidraw
+    uint32_t              hid_log_us;   // last pad-state log line while the mic streams
+    // hid-playstation reads the mic-mute button bit in every 0x31 input report, mic frames
+    // included, and toggles the controller's hardware mic mute on each rising edge. Opus
+    // bytes make that happen ~30 times a second, so each such edge is answered at once.
+    uint32_t              kern_mute_edges;   // rising edges inside mic frames while streaming
+    uint32_t              mic_fixes;         // mic-state writes sent to undo them
+    bool                  mic_want_valid;    // mic state set by input_mic_set_state
+    bool                  mic_want_muted;    // wanted controller mic mute (= not streaming)
+    bool                  mic_want_led;      // wanted mute LED
+    uint32_t              muted_reports;     // state reports with the controller's mic muted
+    int                   pad_mic_muted;     // controller status mic-mute bit, -1 unknown
 
     GamepadDev    pads[MAX_DEVS];
     int           num_pads;       // all opened nodes (gamepads and companions)
@@ -471,6 +502,7 @@ static bool apply_touch_event(ChiakiControllerState *st, GamepadDev *d,
 static void motion_init(MotionState *m)
 {
     chiaki_orientation_tracker_init(&m->tracker);
+    m->clock = MOTION_CLOCK_NONE;
     chiaki_accel_new_zero_set_inactive(&m->zero, false);
     chiaki_accel_new_zero_set_inactive(&m->real, true);
 }
@@ -480,6 +512,20 @@ static uint32_t monotonic_us(void)
     struct timespec ts;
     get_monotonic(&ts);
     return (uint32_t)((uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u);
+}
+
+// One sample: v = accel x,y,z in g, gyro x,y,z in deg/s.
+static void motion_sample(ChiakiControllerState *st, MotionState *m, const float v[6], uint32_t ts_us, MotionClock clock)
+{
+    const float deg2rad = (float)(M_PI / 180.0);
+    if (m->clock != clock) {   // the tracker would integrate the gap between two time bases: minutes of rotation
+        m->clock = clock;
+        m->tracker.timestamp = ts_us;
+    }
+    float gx = v[3] * deg2rad, gy = v[4] * deg2rad, gz = v[5] * deg2rad;
+    chiaki_accel_new_zero_set_active(&m->real, v[0], v[1], v[2], true);
+    chiaki_orientation_tracker_update(&m->tracker, gx, gy, gz, v[0], v[1], v[2], &m->zero, false, ts_us);
+    chiaki_orientation_tracker_apply_to_controller_state(&m->tracker, st);
 }
 
 // Returns true when a complete sample was applied to the controller state.
@@ -495,12 +541,8 @@ static bool apply_motion_event(ChiakiControllerState *st, GamepadDev *d, MotionS
         int res = d->motion_res[i] > 0 ? d->motion_res[i] : (i < 3 ? 8192 : 1024);
         v[i] = (float)d->motion_raw[i] / (float)res;
     }
-    const float deg2rad = (float)(M_PI / 180.0);
-    float gx = v[3] * deg2rad, gy = v[4] * deg2rad, gz = v[5] * deg2rad;
-    chiaki_accel_new_zero_set_active(&m->real, v[0], v[1], v[2], true);
-    chiaki_orientation_tracker_update(&m->tracker, gx, gy, gz, v[0], v[1], v[2], &m->zero, false,
-                                      d->motion_have_ts ? d->motion_ts : monotonic_us());
-    chiaki_orientation_tracker_apply_to_controller_state(&m->tracker, st);
+    if (d->motion_have_ts) motion_sample(st, m, v, d->motion_ts, MOTION_CLOCK_PAD);
+    else motion_sample(st, m, v, monotonic_us(), MOTION_CLOCK_HOST);
     return true;
 }
 
@@ -514,6 +556,155 @@ static void motion_reset(ChiakiControllerState *st, MotionState *m)
     chiaki_orientation_tracker_update(&m->tracker, gx, gy, gz,
                                       m->real.accel_x, m->real.accel_y, m->real.accel_z, &m->zero, false, ts);
     chiaki_orientation_tracker_apply_to_controller_state(&m->tracker, st);
+}
+
+// ── DualSense state from hidraw (only while the mic streams) ───────────────────
+// Same units and mapping as the evdev path: sticks via normalize_axis, touch scaled to
+// the PS touchpad, IMU calibrated like hid-playstation then fed to the same tracker.
+static void apply_ds5_input(ChiakiControllerState *st, GamepadDev *pad, MotionState *m, const Ds5Input *in)
+{
+    uint32_t b = ds5_chiaki_buttons(in);
+    st->buttons = (st->buttons & ~pad->hid_buttons) | b;
+    pad->hid_buttons = b;
+    st->left_x  = normalize_axis(in->lx, 0, 255);
+    st->left_y  = normalize_axis(in->ly, 0, 255);
+    st->right_x = normalize_axis(in->rx, 0, 255);
+    st->right_y = normalize_axis(in->ry, 0, 255);
+    st->l2_state = in->l2;
+    st->r2_state = in->r2;
+    for (int t = 0; t < TOUCH_SLOTS; t++) {
+        TouchSlot *ts = &pad->slots[t];
+        uint16_t x = touch_scale(in->touch[t].x, 0, 1919, PS_TOUCHPAD_MAXX);
+        uint16_t y = touch_scale(in->touch[t].y, 0, 1079, PS_TOUCHPAD_MAXY);
+        if (in->touch[t].active && ts->chiaki_id < 0)
+            ts->chiaki_id = chiaki_controller_state_start_touch(st, x, y);
+        else if (in->touch[t].active)
+            chiaki_controller_state_set_touch_pos(st, (uint8_t)ts->chiaki_id, x, y);
+        else if (ts->chiaki_id >= 0) {
+            chiaki_controller_state_stop_touch(st, (uint8_t)ts->chiaki_id);
+            ts->chiaki_id = -1;
+        }
+    }
+    int32_t g[3], a[3];
+    ds5_calibrate(&pad->calib, in, g, a);
+    float v[6] = { a[0] / 8192.0f, a[1] / 8192.0f, a[2] / 8192.0f,
+                   g[0] / 1024.0f, g[1] / 1024.0f, g[2] / 1024.0f };
+    motion_sample(st, m, v, monotonic_us(), MOTION_CLOCK_HOST);
+}
+
+// hidraw owns the pad state while the mic streams and until 300 ms after the last mic frame:
+// frames still in flight after the stop reach the kernel too and would leak phantom presses.
+#define MIC_TAIL_US 300000u
+static bool hid_owns(InputContext *ctx)
+{
+    return ctx->mic_stream || (ctx->last_mic_us && (uint32_t)(monotonic_us() - ctx->last_mic_us) < MIC_TAIL_US);
+}
+
+// Hand the pad state between evdev and hidraw without stuck buttons or contacts.
+static void hid_ownership_update(InputContext *ctx)
+{
+    bool owns = hid_owns(ctx);
+    pthread_mutex_lock(&ctx->state_mutex);
+    if (owns == ctx->hid_owned) { pthread_mutex_unlock(&ctx->state_mutex); return; }
+    ctx->hid_owned = owns;
+    for (int i = 0; i < ctx->num_pads; i++) {
+        touch_release_all(&ctx->state, &ctx->pads[i]);
+        ctx->state.buttons &= ~ctx->pads[i].hid_buttons;
+        ctx->pads[i].hid_buttons = 0;
+    }
+    ChiakiControllerState snap = ctx->state;
+    pthread_mutex_unlock(&ctx->state_mutex);
+    if (ctx->session) chiaki_session_set_controller_state(ctx->session, &snap);
+    app_log("[INPUT] Pad state now from %s (hidraw reports so far: %u state, %u mic)\n",
+            owns ? "hidraw" : "evdev", ctx->hid_state_reports, ctx->hid_mic_frames);
+}
+
+// The wanted mic state again (0x31: mic volume, mic mute, mute LED), to undo the kernel's toggles.
+static void ds5_mic_state_write(InputContext *ctx, GamepadDev *pad)
+{
+    uint8_t c[DS5_COMMON_SIZE] = {0}, rep[DS5_BT_REPORT_SIZE];
+    ds5_set_mic(c, ctx->mic_want_muted);
+    c[DS5_MUTE_LED] = ctx->mic_want_led ? 1 : 0;
+    pthread_mutex_lock(&ctx->out_mutex);
+    ds5_bt_report(rep, ctx->out_seq++, c);
+    if (write(pad->hid_fd, rep, sizeof(rep)) == (ssize_t)sizeof(rep)) ctx->mic_fixes++;
+    pthread_mutex_unlock(&ctx->out_mutex);
+}
+
+// Read the pad's hidraw: mic frames to the mic handler, mute-button presses to the
+// handler, and (while the mic streams) the pad state.
+static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
+{
+    for (int k = 0; k < 16; k++) {
+        uint8_t buf[128];
+        ssize_t n = read(pad->hid_fd, buf, sizeof(buf));
+        if (n <= 0) return;
+        Ds5Input in;
+        const uint8_t *opus = NULL;
+        size_t opus_len = 0;
+        Ds5InKind kind = ds5_parse_bt_input(buf, (size_t)n, &in, &opus, &opus_len);
+        bool kern_edge = false;
+        if (pad->mic_fix_due) {   // the kernel's write for the last edge has been queued by now
+            pad->mic_fix_due = false;
+            if (ctx->mic_stream) ds5_mic_state_write(ctx, pad);
+        }
+        if (n >= 12 && buf[0] == 0x31) {   // the byte hid-playstation reads as buttons[2]
+            bool kb = buf[11] & 0x04;
+            kern_edge = kb && !pad->kern_mute_prev;
+            pad->kern_mute_prev = kb;
+            if (kern_edge) pad->kern_muted = !pad->kern_muted;   // the kernel toggles on every edge
+        }
+        if (kind == DS5_IN_MIC) {
+            ctx->hid_mic_frames++;
+            ctx->last_mic_us = monotonic_us();
+            if (kern_edge && ctx->mic_stream) {   // phantom mute press
+                ctx->kern_mute_edges++;
+                if (pad->kern_muted)               // the kernel is muting: undo it after its write
+                    pad->mic_fix_due = true;
+            }
+            if (ctx->mic_stream && ctx->mic.opus_frame)
+                ctx->mic.opus_frame(opus, opus_len, in.mic_seq, ctx->mic.user);
+            continue;
+        }
+        if (kind != DS5_IN_STATE) continue;
+        ctx->hid_state_reports++;
+        bool mute = ds5_mute_button(&in);
+        if (mute && !pad->mute_prev && ctx->mic.mute_button)
+            ctx->mic.mute_button(ctx->mic.user);
+        pad->mute_prev = mute;
+        int pm = ds5_mic_muted(&in);
+        if (pm != ctx->pad_mic_muted && !ctx->mic_stream)
+            app_log("[INPUT] controller mic mute: %s\n", pm ? "on" : "off");
+        ctx->pad_mic_muted = pm;
+        if (ctx->mic_want_valid && pm != (int)ctx->mic_want_muted) {   // backstop: kernel toggled it
+            if (ctx->mic_stream) ctx->muted_reports++;
+            pad->kern_muted = pm;   // only the kernel writes the other state: relearn its toggle
+            ds5_mic_state_write(ctx, pad);
+        }
+        if (!hid_owns(ctx)) continue;
+        pthread_mutex_lock(&ctx->state_mutex);
+        apply_ds5_input(&ctx->state, pad, &ctx->motion, &in);
+        ChiakiControllerState snap = ctx->state;
+        pthread_mutex_unlock(&ctx->state_mutex);
+        uint32_t t = monotonic_us();
+        if ((uint32_t)(t - ctx->hid_log_us) >= 5000000u) {
+            ctx->hid_log_us = t;
+            app_log("[INPUT] hidraw pad: buttons=%#x L2=%u R2=%u sticks %d,%d %d,%d (reports %u state, %u mic; kernel mute toggles %u, unmute writes %u, muted state reports %u)\n",
+                    snap.buttons, snap.l2_state, snap.r2_state, snap.left_x, snap.left_y,
+                    snap.right_x, snap.right_y, ctx->hid_state_reports, ctx->hid_mic_frames, ctx->kern_mute_edges, ctx->mic_fixes, ctx->muted_reports);
+        }
+        if (ctx->session)
+            chiaki_session_set_controller_state(ctx->session, &snap);
+    }
+}
+
+// While the mic streams, evdev nodes of a pad read through hidraw are drained, not applied.
+static bool evdev_suppressed(InputContext *ctx, const GamepadDev *d)
+{
+    if (!hid_owns(ctx) || !d->uniq[0]) return false;
+    for (int i = 0; i < ctx->num_pads; i++)
+        if (ctx->pads[i].hid_fd >= 0 && strcmp(ctx->pads[i].uniq, d->uniq) == 0) return true;
+    return false;
 }
 
 // ── Evdev reader thread ────────────────────────────────────────────────────────
@@ -533,6 +724,11 @@ static void *evdev_reader(void *arg)
                 FD_SET(ctx->pads[i].fd, &rfds);
                 if (ctx->pads[i].fd > maxfd)
                     maxfd = ctx->pads[i].fd;
+            }
+            int h = ctx->pads[i].hid_fd;
+            if (h >= 0) {
+                FD_SET(h, &rfds);
+                if (h > maxfd) maxfd = h;
             }
         }
 
@@ -555,7 +751,14 @@ static void *evdev_reader(void *arg)
         }
 
         haptics_idle_check(ctx);
+        hid_ownership_update(ctx);
         if (sel <= 0) continue;
+
+        for (int i = 0; i < ctx->num_pads; i++) {
+            int h = ctx->pads[i].hid_fd;
+            if (h >= 0 && FD_ISSET(h, &rfds))
+                read_ds5_hidraw(ctx, &ctx->pads[i]);
+        }
 
         for (int i = 0; i < ctx->num_pads; i++) {
             if (ctx->pads[i].fd < 0) continue;
@@ -591,6 +794,7 @@ static void *evdev_reader(void *arg)
                 }
                 continue;
             }
+            if (evdev_suppressed(ctx, &ctx->pads[i])) continue;
             for (ssize_t k = 0; k + (ssize_t)sizeof(struct input_event) <= n; k += sizeof(struct input_event)) {
                 struct input_event ev = evs[k / sizeof(struct input_event)];
                 bool changed = false;
@@ -898,6 +1102,12 @@ static void open_gamepads(InputContext *ctx)
         pad->kind = DEV_PAD;
         ioctl(fd, EVIOCGUNIQ(sizeof(pad->uniq) - 1), pad->uniq);
         pad->hid_fd = ds5_is_dualsense(id.vendor, id.product) ? open_ds5_hidraw(pad->uniq, &pad->ds5_enhanced) : -1;
+        if (pad->hid_fd >= 0) {
+            uint8_t f[64] = { 0x05 };
+            int fn = ioctl(pad->hid_fd, HIDIOCGFEATURE(sizeof(f)), f);
+            bool ok = fn > 0 && ds5_calib_from_feature(&pad->calib, f, (size_t)fn);
+            app_log("[INPUT] DualSense IMU calibration (feature 0x05): %s\n", ok ? "OK" : "missing; raw values");
+        }
         pad->fd = fd;
         ctx->num_pads++;
         num_main++;
@@ -928,6 +1138,7 @@ InputContext *input_init(void)
     pthread_mutex_init(&ctx->state_mutex, NULL);
     pthread_mutex_init(&ctx->out_mutex, NULL);
     ctx->running = true;
+    ctx->pad_mic_muted = -1;
     ctx->session = NULL;
 
     open_gamepads(ctx);
@@ -1105,6 +1316,43 @@ static void ds5_triggers_off(InputContext *ctx)
     pthread_mutex_unlock(&ctx->out_mutex);
 }
 
+void input_set_mic_handler(InputContext *ctx, const InputMicHandler *h)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->state_mutex);
+    if (h) ctx->mic = *h; else memset(&ctx->mic, 0, sizeof(ctx->mic));
+    pthread_mutex_unlock(&ctx->state_mutex);
+}
+
+bool input_mic_set_state(InputContext *ctx, bool stream, bool mute_led)
+{
+    if (!ctx) return false;
+    bool any = false;
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_mic(c, !stream);
+    c[DS5_MUTE_LED] = mute_led ? 1 : 0;
+    pthread_mutex_lock(&ctx->out_mutex);
+    ctx->mic_want_muted = !stream;
+    ctx->mic_want_led = mute_led;
+    ctx->mic_want_valid = true;
+    for (int i = 0; i < ctx->num_pads; i++) {
+        GamepadDev *d = &ctx->pads[i];
+        if (d->hid_fd < 0) continue;
+        uint8_t rep[DS5_BT_REPORT_SIZE], mc[DS5_MIC_CONTROL_SIZE];
+        ds5_bt_report(rep, ctx->out_seq++, c);
+        ds5_mic_control_report(mc, ctx->out_seq++, stream);
+        ssize_t w1 = write(d->hid_fd, rep, sizeof(rep));
+        ssize_t w2 = write(d->hid_fd, mc, sizeof(mc));
+        app_log("[INPUT] DualSense mic %s, mute LED %s: writes %zd/%zd\n", stream ? "stream on" : "stream off",
+                mute_led ? "on" : "off", w1, w2);
+        any |= w1 == (ssize_t)sizeof(rep) && w2 == (ssize_t)sizeof(mc);
+    }
+    pthread_mutex_unlock(&ctx->out_mutex);
+    ctx->mic_stream = stream && any;
+    hid_ownership_update(ctx);   // to hidraw at once; back to evdev after the mic tail
+    return any;
+}
+
 bool input_has_dualsense_output(InputContext *ctx)
 {
     if (!ctx) return false;
@@ -1155,6 +1403,7 @@ void input_set_session(InputContext *ctx, ChiakiSession *session)
 {
     if (!ctx) return;
     if (!session) {
+        if (ctx->mic_stream) input_mic_set_state(ctx, false, false);
         input_set_rumble(ctx, 0, 0);
         pthread_mutex_lock(&ctx->state_mutex);
         if (ctx->hap_frames_total)
@@ -1179,6 +1428,7 @@ void input_fini(InputContext *ctx)
     if (!ctx) return;
     ctx->running = false;
     pthread_join(ctx->reader_thread, NULL);
+    if (ctx->mic_stream) input_mic_set_state(ctx, false, false);
     input_set_rumble(ctx, 0, 0);
     ds5_triggers_off(ctx);
     for (int i = 0; i < ctx->num_pads; i++) {

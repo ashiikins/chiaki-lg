@@ -61,6 +61,37 @@ void ds5_set_rumble(uint8_t common[DS5_COMMON_SIZE], uint8_t left, uint8_t right
     }
 }
 
+void ds5_set_mic(uint8_t common[DS5_COMMON_SIZE], bool muted)
+{
+    common[DS5_FLAG0] |= DS5_FLAG0_MIC_VOLUME;
+    common[DS5_FLAG1] |= DS5_FLAG1_MUTE_LED | DS5_FLAG1_POWER_SAVE;
+    common[DS5_MIC_VOLUME] = 0x40;
+    common[DS5_MUTE_LED] = muted ? 1 : 0;
+    common[DS5_POWER_SAVE] = muted ? DS5_POWER_SAVE_MIC_MUTE : 0;
+}
+
+static void ds5_put_crc(uint8_t *out, size_t size)
+{
+    const uint8_t hdr = 0xA2;
+    uint32_t crc = ds5_crc32(0, &hdr, 1);
+    crc = ds5_crc32(crc, out, size - 4);
+    out[size - 4] = (uint8_t)crc;
+    out[size - 3] = (uint8_t)(crc >> 8);
+    out[size - 2] = (uint8_t)(crc >> 16);
+    out[size - 1] = (uint8_t)(crc >> 24);
+}
+
+void ds5_mic_control_report(uint8_t out[DS5_MIC_CONTROL_SIZE], uint8_t seq, bool enable)
+{
+    memset(out, 0, DS5_MIC_CONTROL_SIZE);
+    out[0] = 0x32;
+    out[1] = (uint8_t)((seq & 0x0f) << 4);
+    out[2] = 0x91;
+    out[3] = 1;
+    out[4] = enable ? 0x03 : 0x02;
+    ds5_put_crc(out, DS5_MIC_CONTROL_SIZE);
+}
+
 void ds5_bt_report(uint8_t out[DS5_BT_REPORT_SIZE], uint8_t seq, const uint8_t common[DS5_COMMON_SIZE])
 {
     memset(out, 0, DS5_BT_REPORT_SIZE);
@@ -68,13 +99,7 @@ void ds5_bt_report(uint8_t out[DS5_BT_REPORT_SIZE], uint8_t seq, const uint8_t c
     out[1] = (uint8_t)((seq & 0x0f) << 4);
     out[2] = 0x10;
     memcpy(&out[3], common, DS5_COMMON_SIZE);
-    const uint8_t hdr = 0xA2;
-    uint32_t crc = ds5_crc32(0, &hdr, 1);
-    crc = ds5_crc32(crc, out, DS5_BT_REPORT_SIZE - 4);
-    out[74] = (uint8_t)crc;
-    out[75] = (uint8_t)(crc >> 8);
-    out[76] = (uint8_t)(crc >> 16);
-    out[77] = (uint8_t)(crc >> 24);
+    ds5_put_crc(out, DS5_BT_REPORT_SIZE);
 }
 
 bool ds5_is_dualsense(uint16_t vendor, uint16_t product)

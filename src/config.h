@@ -22,6 +22,8 @@ typedef struct {
     bool     auto_connect;      // connect automatically after a countdown (once per launch)
     int      auto_connect_delay_ms; // countdown length; any input cancels it
     bool     enable_dualsense;  // DualSense mode: PS5 sends haptics, trigger effects, player LEDs
+    bool     dualsense_mic_unmuted; // start each session with the mic on (default: muted)
+    bool     dualsense_mic;     // with DualSense mode: the controller mic over Bluetooth (mic button unmutes)
     int      hevc_rps_keep;     // H.265: max short-term refs kept per slice (0 = off)
     char    *ss4s_module;
     int      log_level;         // chiaki bitmask: DEBUG=1 VERBOSE=2 INFO=4 WARNING=8 ERROR=16

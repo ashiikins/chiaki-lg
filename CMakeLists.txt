@@ -132,6 +132,8 @@ add_executable(chiaki-webos
     src/audio.c
     src/input.c
     src/ds5_out.c
+    src/ds5_in.c
+    src/mic.c
     src/ui.c
     src/stats.c
 )

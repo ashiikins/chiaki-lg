@@ -36,6 +36,7 @@
 #include "video.h"
 #include "audio.h"
 #include "input.h"
+#include "mic.h"
 #include "ui.h"
 #include "stats.h"
 #include "config_import.h"
@@ -129,6 +130,7 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 
 // Set while input is initialised; the session callback runs on a chiaki thread.
 static InputContext *g_input_ctx;
+static MicContext *g_mic;            // DualSense Bluetooth mic, NULL when off
 static void haptics_frame_cb(uint8_t *buf, size_t buf_size, void *user)
 {
     input_haptics_frame((InputContext *)user, buf, buf_size);
@@ -142,6 +144,7 @@ static void session_event_cb(ChiakiEvent *event, void *user)
     {
     case CHIAKI_EVENT_CONNECTED:
         app_log("[APP] Connected to PS5\n");
+        mic_session_connected(g_mic);
         break;
     case CHIAKI_EVENT_LOGIN_PIN_REQUEST:
         app_log("[APP] PIN requested — register first using chiaki-ng on PC\n");
@@ -1320,6 +1323,10 @@ int main(int argc, char *argv[])
     info.enable_dualsense = cfg.enable_dualsense && input_has_dualsense_output(input_ctx);
     app_log("[APP] DualSense mode: %s\n", info.enable_dualsense ? "on" :
             cfg.enable_dualsense ? "off (no DualSense with Bluetooth output)" : "off (config)");
+    if (info.enable_dualsense && cfg.dualsense_mic)
+        g_mic = mic_new(input_ctx, &chiaki_log, cfg.dualsense_mic_unmuted);
+    app_log("[APP] DualSense mic: %s\n", g_mic ? "on (mic button unmutes)" :
+            info.enable_dualsense && cfg.dualsense_mic ? "off (init failed)" : "off");
 
     // ── Session / reconnect loop ──────────────────────────────────────────────
     // We stay inside this loop until the user deliberately exits (Home button,
@@ -1487,6 +1494,7 @@ int main(int argc, char *argv[])
         // controller state updates. The reader thread was started in
         // input_init() and waits for a non-NULL session pointer.
         input_set_session(input_ctx, &g_session);
+        mic_session_start(g_mic, &g_session);
         app_log_always("[APP] Session started — entering event loop\n");
 
         // ── Per-session event loop ────────────────────────────────────────────
@@ -1637,6 +1645,7 @@ int main(int argc, char *argv[])
         }
 
         // Detach session from evdev reader before tearing down the session.
+        mic_session_stop(g_mic);
         input_set_session(input_ctx, NULL);
         app_log_always("[APP] Stopping session (reason=%d)\n", (int)g_quit_reason);
         chiaki_session_stop(&g_session);
@@ -1658,6 +1667,8 @@ int main(int argc, char *argv[])
     }
 
 cleanup_session_ctx:
+    mic_free(g_mic);
+    g_mic = NULL;
     g_input_ctx = NULL;
     input_fini(input_ctx);
     audio_fini(audio_ctx);
