@@ -173,6 +173,8 @@ struct InputContext {
     volatile bool         mic_stream;
     InputMicHandler       mic;
     uint32_t              hid_mic_frames, hid_state_reports;
+    uint32_t              last_mic_us;     // time of the last mic frame
+    bool                  hid_owned;       // pad state currently read from hidraw
     uint32_t              hid_log_us;   // last pad-state log line while the mic streams
     // hid-playstation reads the mic-mute button bit in every 0x31 input report, mic frames
     // included, and toggles the controller's hardware mic mute on each rising edge. Opus
@@ -587,6 +589,33 @@ static void apply_ds5_input(ChiakiControllerState *st, GamepadDev *pad, MotionSt
     motion_sample(st, m, v, monotonic_us());
 }
 
+// hidraw owns the pad state while the mic streams and until 300 ms after the last mic frame:
+// frames still in flight after the stop reach the kernel too and would leak phantom presses.
+#define MIC_TAIL_US 300000u
+static bool hid_owns(InputContext *ctx)
+{
+    return ctx->mic_stream || (ctx->last_mic_us && (uint32_t)(monotonic_us() - ctx->last_mic_us) < MIC_TAIL_US);
+}
+
+// Hand the pad state between evdev and hidraw without stuck buttons or contacts.
+static void hid_ownership_update(InputContext *ctx)
+{
+    bool owns = hid_owns(ctx);
+    pthread_mutex_lock(&ctx->state_mutex);
+    if (owns == ctx->hid_owned) { pthread_mutex_unlock(&ctx->state_mutex); return; }
+    ctx->hid_owned = owns;
+    for (int i = 0; i < ctx->num_pads; i++) {
+        touch_release_all(&ctx->state, &ctx->pads[i]);
+        ctx->state.buttons &= ~ctx->pads[i].hid_buttons;
+        ctx->pads[i].hid_buttons = 0;
+    }
+    ChiakiControllerState snap = ctx->state;
+    pthread_mutex_unlock(&ctx->state_mutex);
+    if (ctx->session) chiaki_session_set_controller_state(ctx->session, &snap);
+    app_log("[INPUT] Pad state now from %s (hidraw reports so far: %u state, %u mic)\n",
+            owns ? "hidraw" : "evdev", ctx->hid_state_reports, ctx->hid_mic_frames);
+}
+
 // The wanted mic state again (0x31: mic volume, mic mute, mute LED), to undo the kernel's toggles.
 static void ds5_mic_state_write(InputContext *ctx, GamepadDev *pad)
 {
@@ -624,6 +653,7 @@ static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
         }
         if (kind == DS5_IN_MIC) {
             ctx->hid_mic_frames++;
+            ctx->last_mic_us = monotonic_us();
             if (kern_edge && ctx->mic_stream) {   // phantom mute press
                 ctx->kern_mute_edges++;
                 if (pad->kern_muted)               // the kernel is muting: undo it after its write
@@ -649,7 +679,7 @@ static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
             pad->kern_muted = pm;   // only the kernel writes the other state: relearn its toggle
             ds5_mic_state_write(ctx, pad);
         }
-        if (!ctx->mic_stream) continue;
+        if (!hid_owns(ctx)) continue;
         pthread_mutex_lock(&ctx->state_mutex);
         apply_ds5_input(&ctx->state, pad, &ctx->motion, &in);
         ChiakiControllerState snap = ctx->state;
@@ -669,7 +699,7 @@ static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
 // While the mic streams, evdev nodes of a pad read through hidraw are drained, not applied.
 static bool evdev_suppressed(InputContext *ctx, const GamepadDev *d)
 {
-    if (!ctx->mic_stream || !d->uniq[0]) return false;
+    if (!hid_owns(ctx) || !d->uniq[0]) return false;
     for (int i = 0; i < ctx->num_pads; i++)
         if (ctx->pads[i].hid_fd >= 0 && strcmp(ctx->pads[i].uniq, d->uniq) == 0) return true;
     return false;
@@ -719,6 +749,7 @@ static void *evdev_reader(void *arg)
         }
 
         haptics_idle_check(ctx);
+        hid_ownership_update(ctx);
         if (sel <= 0) continue;
 
         for (int i = 0; i < ctx->num_pads; i++) {
@@ -1321,20 +1352,8 @@ bool input_mic_set_state(InputContext *ctx, bool stream, bool mute_led)
         any |= w1 == (ssize_t)sizeof(rep) && w2 == (ssize_t)sizeof(mc);
     }
     pthread_mutex_unlock(&ctx->out_mutex);
-    // Hand the pad state back and forth between evdev and hidraw without stuck contacts.
-    pthread_mutex_lock(&ctx->state_mutex);
-    bool was = ctx->mic_stream;
     ctx->mic_stream = stream && any;
-    if (was != ctx->mic_stream) {
-        for (int i = 0; i < ctx->num_pads; i++) {
-            touch_release_all(&ctx->state, &ctx->pads[i]);
-            ctx->state.buttons &= ~ctx->pads[i].hid_buttons;
-            ctx->pads[i].hid_buttons = 0;
-        }
-        app_log("[INPUT] Pad state now from %s (hidraw reports so far: %u state, %u mic)\n",
-                ctx->mic_stream ? "hidraw" : "evdev", ctx->hid_state_reports, ctx->hid_mic_frames);
-    }
-    pthread_mutex_unlock(&ctx->state_mutex);
+    hid_ownership_update(ctx);   // to hidraw at once; back to evdev after the mic tail
     return any;
 }
 
