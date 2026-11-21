@@ -143,7 +143,8 @@ static void session_event_cb(ChiakiEvent *event, void *user)
     switch (event->type)
     {
     case CHIAKI_EVENT_CONNECTED:
-        app_log("[APP] Connected to PS5\n");
+        app_log_always("[APP] Connected to PS5, Remote Play protocol (Takion) version %u\n",
+                       chiaki_session_get_takion_version(&g_session));
         mic_session_connected(g_mic);
         break;
     case CHIAKI_EVENT_LOGIN_PIN_REQUEST:
@@ -1317,6 +1318,7 @@ int main(int argc, char *argv[])
     info.video_profile.bitrate = cfg.video_bitrate;
 
     info.video_profile.codec = requested_codec;
+    info.takion_version = (uint8_t)cfg.takion_version;
 
     // DualSense mode only with a DualSense whose output reports work: the PS5 then sends
     // haptics as audio instead of rumble events.

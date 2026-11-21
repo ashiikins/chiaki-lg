@@ -483,6 +483,16 @@ fi
 echo ""
 echo "=== Patching chiaki-ng sources for webOS ==="
 
+# Takion protocol 15/20, as current PS5 Remote Play clients negotiate, with fallback to 12.
+# Made against chiaki-ng 83b29398.
+TAKION_PATCH="$SCRIPT_DIR/patches/chiaki-ng-takion-v20.patch"
+if git -C "$CHIAKI_NG_DIR" apply --reverse --check "$TAKION_PATCH" 2>/dev/null; then
+    echo "-- takion v20: already applied"
+else
+    git -C "$CHIAKI_NG_DIR" apply "$TAKION_PATCH"
+    echo "-- takion v20: applied"
+fi
+
 # pthread_clockjoin_np was added in glibc 2.30.
 # webOS uses an older glibc that only has pthread_timedjoin_np (uses CLOCK_REALTIME).
 # The difference: clockjoin lets you pick the clock; timedjoin always uses CLOCK_REALTIME.

@@ -109,6 +109,9 @@ int config_load(AppConfig *cfg, const char *path)
     cfg->dualsense_haptics = json_get_bool(root, "dualsense_haptics", true);
     cfg->dualsense_mic    = json_get_bool(root, "dualsense_mic",    true);
     cfg->dualsense_mic_unmuted = json_get_bool(root, "dualsense_mic_unmuted", false);
+    cfg->takion_version   = json_get_int(root,  "takion_version",   0);
+    if (cfg->takion_version != 12 && cfg->takion_version != 15 && cfg->takion_version != 20)
+        cfg->takion_version = 0;
     cfg->hevc_rps_keep    = json_get_int(root,  "hevc_rps_keep",    4);
     if (cfg->hevc_rps_keep < 0)  cfg->hevc_rps_keep = 0;
     if (cfg->hevc_rps_keep > 16) cfg->hevc_rps_keep = 16;
