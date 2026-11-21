@@ -141,7 +141,9 @@ static void on_mute_button(void *user)
         m->mic_connected = e == CHIAKI_ERR_SUCCESS;
         if (!m->mic_connected) { pthread_mutex_unlock(&m->mutex); return; }
     }
-    ChiakiErrorCode e = chiaki_session_toggle_microphone(m->session, mute);
+    // libchiaki's argument is the state before the toggle: true sends "unmute" (ctrl.c,
+    // toggle[2] = 0), as chiaki-ng's ToggleMute passes its current muted flag.
+    ChiakiErrorCode e = chiaki_session_toggle_microphone(m->session, !mute);
     m->muted = mute;
     if (!mute) { m->stats_ms = now_ms(); m->frames = 0; m->have_seq = false; }
     else stats_log(m, true);
