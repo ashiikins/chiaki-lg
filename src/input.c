@@ -1,9 +1,11 @@
 #include "input.h"
+#include "ds5_out.h"
 #include "app_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -15,6 +17,7 @@
 #include <sys/select.h>
 #include <time.h>
 #include <linux/input.h>
+#include <linux/hidraw.h>
 
 // ── Fallback defines for old kernel headers (pre-3.16 webOS sysroot) ──────────
 // These gamepad layout aliases were added in Linux 3.16.
@@ -117,6 +120,10 @@ typedef struct {
     char uniq[32];      // shared by a pad's main, Touchpad and Motion Sensors nodes
     TouchSlot slots[TOUCH_SLOTS];
     int  cur_slot;
+    int      hid_fd;         // DualSense hidraw for output reports, -1 = none (out_mutex)
+    bool     ds5_enhanced;   // firmware 2.24+ rumble mode (or firmware unknown)
+    int      ff_id;          // uploaded FF_RUMBLE effect id, -1 = none
+    bool     ff_rumble;      // Sony pad opened read-write with FF_RUMBLE support
     int      motion_res[6];  // Motion Sensors: units per g (ABS_X..Z), per deg/s (ABS_RX..RZ)
     int      motion_raw[6];
     uint32_t motion_ts;      // MSC_TIMESTAMP, microseconds
@@ -137,6 +144,19 @@ typedef struct {
 struct InputContext {
     ChiakiControllerState state;
     MotionState           motion;
+    pthread_mutex_t       out_mutex;     // hidraw fds, sequence, last trigger state
+    uint8_t               out_seq;
+    unsigned              out_logged;    // one log line per report kind
+    bool                  trig_valid;
+    bool                  rumble_logged;
+    uint32_t              hap_frames_total;  // per session, for the log
+    uint16_t              hap_peak;
+    // haptics -> rumble (chiaki-ng's method, "Normal" strength)
+    uint32_t              hap_sum;
+    int                   hap_frames;
+    uint8_t               hap_sent;      // last strength sent, 0 = motors off
+    struct timespec       hap_last;      // last frame received
+    uint8_t               trig_last[22];
     pthread_mutex_t       state_mutex;
 
     GamepadDev    pads[MAX_DEVS];
@@ -497,6 +517,8 @@ static void motion_reset(ChiakiControllerState *st, MotionState *m)
 }
 
 // ── Evdev reader thread ────────────────────────────────────────────────────────
+static void haptics_idle_check(InputContext *ctx);
+
 static void *evdev_reader(void *arg)
 {
     InputContext *ctx = (InputContext *)arg;
@@ -532,19 +554,26 @@ static void *evdev_reader(void *arg)
             }
         }
 
+        haptics_idle_check(ctx);
         if (sel <= 0) continue;
 
         for (int i = 0; i < ctx->num_pads; i++) {
             if (ctx->pads[i].fd < 0) continue;
             if (!FD_ISSET(ctx->pads[i].fd, &rfds)) continue;
 
-            struct input_event ev;
-            ssize_t n = read(ctx->pads[i].fd, &ev, sizeof(ev));
+            struct input_event evs[32];
+            ssize_t n = read(ctx->pads[i].fd, evs, sizeof(evs));
             if (n < 0) {
                 if (errno == EAGAIN || errno == EINTR) continue;
                 app_log("[INPUT] Gamepad %s disconnected\n", ctx->pads[i].path);
+                pthread_mutex_lock(&ctx->state_mutex);   // rumble writes use the fd
                 close(ctx->pads[i].fd);
                 ctx->pads[i].fd = -1;
+                ctx->pads[i].ff_rumble = false;
+                pthread_mutex_unlock(&ctx->state_mutex);
+                pthread_mutex_lock(&ctx->out_mutex);
+                if (ctx->pads[i].hid_fd >= 0) { close(ctx->pads[i].hid_fd); ctx->pads[i].hid_fd = -1; }
+                pthread_mutex_unlock(&ctx->out_mutex);
                 if (ctx->pads[i].kind == DEV_MOTION) {
                     pthread_mutex_lock(&ctx->state_mutex);
                     motion_init(&ctx->motion);
@@ -562,34 +591,35 @@ static void *evdev_reader(void *arg)
                 }
                 continue;
             }
-            if (n != sizeof(ev)) continue;
-
-            bool changed = false;
-            pthread_mutex_lock(&ctx->state_mutex);
-
-            if (ctx->pads[i].kind == DEV_TOUCH)
-                changed = apply_touch_event(&ctx->state, &ctx->pads[i], ev.type, ev.code, ev.value);
-            else if (ctx->pads[i].kind == DEV_MOTION)
-                changed = apply_motion_event(&ctx->state, &ctx->pads[i], &ctx->motion, ev.type, ev.code, ev.value);
-            else if (ev.type == EV_KEY) { changed = apply_key_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); }
-            else if (ev.type == EV_ABS) { apply_abs_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); changed = true; }
-
-            ChiakiControllerState snap = ctx->state;
-            pthread_mutex_unlock(&ctx->state_mutex);
-
-            if (changed && ctx->session)
-                chiaki_session_set_controller_state(ctx->session, &snap);
-
-            // Handle deferred tap release: button was tapped+released while
-            // still pending — we sent the press above, now immediately release.
-            if (ctx->pads[i].chord.tap_pending) {
+            for (ssize_t k = 0; k + (ssize_t)sizeof(struct input_event) <= n; k += sizeof(struct input_event)) {
+                struct input_event ev = evs[k / sizeof(struct input_event)];
+                bool changed = false;
                 pthread_mutex_lock(&ctx->state_mutex);
-                ctx->state.buttons &= ~ctx->pads[i].chord.tap_pending;
-                ctx->pads[i].chord.tap_pending = 0;
-                ChiakiControllerState snap2 = ctx->state;
+
+                if (ctx->pads[i].kind == DEV_TOUCH)
+                    changed = apply_touch_event(&ctx->state, &ctx->pads[i], ev.type, ev.code, ev.value);
+                else if (ctx->pads[i].kind == DEV_MOTION)
+                    changed = apply_motion_event(&ctx->state, &ctx->pads[i], &ctx->motion, ev.type, ev.code, ev.value);
+                else if (ev.type == EV_KEY) { changed = apply_key_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); }
+                else if (ev.type == EV_ABS) { apply_abs_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); changed = true; }
+
+                ChiakiControllerState snap = ctx->state;
                 pthread_mutex_unlock(&ctx->state_mutex);
-                if (ctx->session)
-                    chiaki_session_set_controller_state(ctx->session, &snap2);
+
+                if (changed && ctx->session)
+                    chiaki_session_set_controller_state(ctx->session, &snap);
+
+                // Handle deferred tap release: button was tapped+released while
+                // still pending — we sent the press above, now immediately release.
+                if (ctx->pads[i].chord.tap_pending) {
+                    pthread_mutex_lock(&ctx->state_mutex);
+                    ctx->state.buttons &= ~ctx->pads[i].chord.tap_pending;
+                    ctx->pads[i].chord.tap_pending = 0;
+                    ChiakiControllerState snap2 = ctx->state;
+                    pthread_mutex_unlock(&ctx->state_mutex);
+                    if (ctx->session)
+                        chiaki_session_set_controller_state(ctx->session, &snap2);
+                }
             }
         }
     }
@@ -713,6 +743,55 @@ static void open_companions(InputContext *ctx)
     closedir(dir);
 }
 
+// Open the DualSense's hidraw node for output reports (lightbar, player LEDs,
+// adaptive triggers). The app jail has /dev/hidraw* but no /sys/class/hidraw, so
+// match by ioctl: DualSense product and HID phys equal to the evdev uniq
+// (Bluetooth address; case differs). Only Bluetooth is handled (report 0x31).
+// Firmware version from feature report 0x20 (bytes 44-45), as SDL. 0 = unknown.
+static uint16_t ds5_firmware(int fd)
+{
+    uint8_t buf[64] = {0x20};
+    int n = ioctl(fd, HIDIOCGFEATURE(sizeof(buf)), buf);
+    return n >= 46 ? (uint16_t)(buf[44] | (buf[45] << 8)) : 0;
+}
+
+static int open_ds5_hidraw(const char *uniq, bool *enhanced)
+{
+    DIR *dir = opendir("/dev");
+    if (!dir) { app_log("[INPUT] hidraw: opendir(/dev) failed: %s\n", strerror(errno)); return -1; }
+    struct dirent *ent;
+    int seen = 0, found = -1;
+    while (found < 0 && (ent = readdir(dir)) != NULL) {
+        if (strncmp(ent->d_name, "hidraw", 6) != 0) continue;
+        char p[64];
+        snprintf(p, sizeof(p), "/dev/%s", ent->d_name);
+        seen++;
+        int fd = open(p, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) { app_log("[INPUT] hidraw %s: open read-write failed: %s\n", p, strerror(errno)); continue; }
+        struct hidraw_devinfo info;
+        char phys[64] = {0};
+        bool ds5 = ioctl(fd, HIDIOCGRAWINFO, &info) == 0 &&
+                   ds5_is_dualsense((uint16_t)info.vendor, (uint16_t)info.product);
+        ioctl(fd, HIDIOCGRAWPHYS(sizeof(phys) - 1), phys);
+        if (!ds5 || !uniq[0] || strcasecmp(phys, uniq) != 0) { close(fd); continue; }
+        if (info.bustype != BUS_BLUETOOTH) {
+            app_log("[INPUT] hidraw %s: DualSense on bus %u, not Bluetooth; output reports off\n", p, info.bustype);
+            close(fd); break;
+        }
+        uint16_t fw = ds5_firmware(fd);
+        // SDL: Edge, unknown firmware over Bluetooth, or 2.24+ use the newer rumble mode.
+        *enhanced = (uint16_t)info.product == 0x0df2 || fw == 0 || fw >= 0x0224;
+        app_log("[INPUT] hidraw %s for %s: open read-write OK; output reports on; firmware 0x%04x, rumble mode %s\n",
+                p, uniq, fw, *enhanced ? "2.24+" : "legacy");
+        found = fd;
+    }
+    closedir(dir);
+    if (found < 0) app_log("[INPUT] hidraw for %s: no usable node (%d hidraw nodes seen)\n", uniq, seen);
+    return found;
+}
+
+static void ds5_triggers_off(InputContext *ctx);
+
 // ── Open and exclusively grab all physical gamepads ───────────────────────────
 static void open_gamepads(InputContext *ctx)
 {
@@ -721,6 +800,7 @@ static void open_gamepads(InputContext *ctx)
     for (int i = 0; i < MAX_DEVS; i++) {
         memset(&ctx->pads[i], 0, sizeof(ctx->pads[i]));
         ctx->pads[i].fd = -1;
+        ctx->pads[i].hid_fd = -1;
         touch_slots_init(&ctx->pads[i]);
     }
 
@@ -792,9 +872,32 @@ static void open_gamepads(InputContext *ctx)
                 id.vendor, id.product, pad->sony_buttons ? "sony" : "xpad",
                 pad->z_triggers ? "ABS_Z/RZ" : "ABS_GAS/BRAKE");
 
+        pad->ff_id = -1;
+        if (pad->sony_buttons) {
+            // Rumble effects need a read-write fd: reopen and move the grab to it.
+            uint8_t ffbits[(FF_MAX + 7) / 8] = {0};
+            ioctl(fd, EVIOCGBIT(EV_FF, sizeof(ffbits)), ffbits);
+            bool rw = false;
+            if (EVDEV_BITS_TEST(ffbits, FF_RUMBLE)) {
+                int rwfd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+                if (rwfd >= 0) {
+                    ioctl(fd, EVIOCGRAB, 0);
+                    close(fd);
+                    fd = rwfd;
+                    rw = true;
+                    if (ioctl(fd, EVIOCGRAB, 1) < 0)
+                        app_log("[INPUT] EVIOCGRAB FAILED on read-write reopen of %s: %s\n", path, strerror(errno));
+                }
+            }
+            pad->ff_rumble = rw;
+            app_log("[INPUT] Rumble on \"%s\": %s\n", devname,
+                    rw ? "FF_RUMBLE" : EVDEV_BITS_TEST(ffbits, FF_RUMBLE) ? "no write access" : "not supported");
+        }
+
         snprintf(pad->path, sizeof(pad->path), "%s", path);
         pad->kind = DEV_PAD;
         ioctl(fd, EVIOCGUNIQ(sizeof(pad->uniq) - 1), pad->uniq);
+        pad->hid_fd = ds5_is_dualsense(id.vendor, id.product) ? open_ds5_hidraw(pad->uniq, &pad->ds5_enhanced) : -1;
         pad->fd = fd;
         ctx->num_pads++;
         num_main++;
@@ -823,19 +926,244 @@ InputContext *input_init(void)
     chiaki_controller_state_set_idle(&ctx->state);
     motion_init(&ctx->motion);
     pthread_mutex_init(&ctx->state_mutex, NULL);
+    pthread_mutex_init(&ctx->out_mutex, NULL);
     ctx->running = true;
     ctx->session = NULL;
 
     open_gamepads(ctx);
+    ds5_triggers_off(ctx);
 
     pthread_create(&ctx->reader_thread, NULL, evdev_reader, ctx);
     return ctx;
+}
+
+// ── Rumble (FF_RUMBLE on the Sony pad's main evdev node) ──────────────────────
+// PS5 values are 0-255: left = strong/low-frequency motor, right = weak/high-frequency.
+static uint16_t rumble_magnitude(uint8_t v) { return (uint16_t)(v * 257u); }
+
+// Caller holds state_mutex (the reader closes fds under it).
+static void ds5_rumble(InputContext *ctx, GamepadDev *d, uint8_t left, uint8_t right);
+
+static void pad_rumble(InputContext *ctx, GamepadDev *d, uint8_t left, uint8_t right)
+{
+    if (!ctx->rumble_logged && (left || right)) {
+        ctx->rumble_logged = true;
+        app_log("[INPUT] First rumble %u/%u on %s via %s\n", left, right, d->path,
+                d->hid_fd >= 0 ? "hidraw report 0x31" : d->ff_rumble ? "FF_RUMBLE" : "nothing");
+    }
+    if (d->hid_fd >= 0) { ds5_rumble(ctx, d, left, right); return; }   // DualSense: as SDL/chiaki-ng
+    if (d->fd < 0 || !d->ff_rumble) return;
+    if (!left && !right) {
+        if (d->ff_id >= 0) {
+            struct input_event stop = { .type = EV_FF, .code = (uint16_t)d->ff_id, .value = 0 };
+            (void)!write(d->fd, &stop, sizeof(stop));
+        }
+        return;
+    }
+    struct ff_effect e;
+    memset(&e, 0, sizeof(e));
+    e.type = FF_RUMBLE;
+    e.id = (int16_t)d->ff_id;
+    e.u.rumble.strong_magnitude = rumble_magnitude(left);
+    e.u.rumble.weak_magnitude = rumble_magnitude(right);
+    e.replay.length = 5000;   // safety stop if no further update arrives (as chiaki-ng's SDL path)
+    if (ioctl(d->fd, EVIOCSFF, &e) < 0) {
+        app_log("[INPUT] Rumble upload failed on %s: %s; rumble off\n", d->path, strerror(errno));
+        d->ff_rumble = false;
+        return;
+    }
+    d->ff_id = e.id;
+    struct input_event play = { .type = EV_FF, .code = (uint16_t)e.id, .value = 1 };
+    (void)!write(d->fd, &play, sizeof(play));
+}
+
+// Strength of one haptics frame, as chiaki-ng: mean of 2*|sample| per channel, the
+// louder channel, below 100 = silence, non-zero values raised to at least 512.
+static uint16_t haptics_strength(const uint8_t *buf, size_t size)
+{
+    size_t n = size / 4;
+    if (!n) return 0;
+    uint32_t suml = 0, sumr = 0;
+    for (size_t i = 0; i < n; i++) {
+        int16_t l, r;
+        memcpy(&l, buf + i * 4, 2);
+        memcpy(&r, buf + i * 4 + 2, 2);
+        suml += (uint32_t)abs(l) * 2;
+        sumr += (uint32_t)abs(r) * 2;
+    }
+    uint32_t sl = suml / n, sr = sumr / n;
+    uint32_t s = sl > sr ? sl : sr;
+    if (s <= 100) return 0;
+    if (s < 512) s = 512;
+    return s > 65535 ? 65535 : (uint16_t)s;
+}
+
+#define HAPTICS_FRAMES_PER_RUMBLE 3     // ~30 ms per motor update, as chiaki-ng
+#define HAPTICS_IDLE_STOP_MS      100
+
+void input_set_rumble(InputContext *ctx, uint8_t left, uint8_t right)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->state_mutex);
+    for (int i = 0; i < ctx->num_pads; i++)
+        if (ctx->pads[i].kind == DEV_PAD)
+            pad_rumble(ctx, &ctx->pads[i], left, right);
+    pthread_mutex_unlock(&ctx->state_mutex);
+}
+
+// ── DualSense output reports (hidraw, Bluetooth report 0x31) ──────────────────
+enum { OUT_LIGHTBAR = 1, OUT_PLAYER = 2, OUT_TRIGGERS = 4, OUT_TRIGGERS_OFF = 8 };
+
+// Caller holds out_mutex.
+static void ds5_send_locked(InputContext *ctx, const uint8_t common[DS5_COMMON_SIZE], unsigned kind)
+{
+    for (int i = 0; i < ctx->num_pads; i++) {
+        GamepadDev *d = &ctx->pads[i];
+        if (d->hid_fd < 0) continue;
+        uint8_t rep[DS5_BT_REPORT_SIZE];
+        ds5_bt_report(rep, ctx->out_seq++, common);
+        ssize_t w = write(d->hid_fd, rep, sizeof(rep));
+        if (w != (ssize_t)sizeof(rep)) {
+            app_log("[INPUT] DualSense output report failed on %s: %zd (%s); output reports off\n",
+                    d->path, w, w < 0 ? strerror(errno) : "short write");
+            close(d->hid_fd);
+            d->hid_fd = -1;
+        } else if (!(ctx->out_logged & kind)) {
+            ctx->out_logged |= kind;
+            app_log("[INPUT] DualSense output report (kind %u) written to %s\n", kind, d->path);
+        }
+    }
+}
+
+static void ds5_rumble(InputContext *ctx, GamepadDev *d, uint8_t left, uint8_t right)
+{
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_rumble(c, left, right, d->ds5_enhanced);
+    pthread_mutex_lock(&ctx->out_mutex);
+    if (d->hid_fd >= 0) {
+        uint8_t rep[DS5_BT_REPORT_SIZE];
+        ds5_bt_report(rep, ctx->out_seq++, c);
+        ssize_t w = write(d->hid_fd, rep, sizeof(rep));
+        if (w != (ssize_t)sizeof(rep)) {
+            app_log("[INPUT] DualSense rumble report failed on %s: %zd (%s); output reports off\n",
+                    d->path, w, w < 0 ? strerror(errno) : "short write");
+            close(d->hid_fd);
+            d->hid_fd = -1;
+        }
+    }
+    pthread_mutex_unlock(&ctx->out_mutex);
+}
+
+static void ds5_send(InputContext *ctx, const uint8_t common[DS5_COMMON_SIZE], unsigned kind)
+{
+    pthread_mutex_lock(&ctx->out_mutex);
+    ds5_send_locked(ctx, common, kind);
+    pthread_mutex_unlock(&ctx->out_mutex);
+}
+
+void input_set_lightbar(InputContext *ctx, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!ctx) return;
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_lightbar(c, r, g, b);
+    ds5_send(ctx, c, OUT_LIGHTBAR);
+}
+
+void input_set_player_index(InputContext *ctx, int player_index)
+{
+    if (!ctx) return;
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_player_lights(c, player_index);
+    ds5_send(ctx, c, OUT_PLAYER);
+}
+
+void input_set_triggers(InputContext *ctx, uint8_t type_left, const uint8_t left[10],
+                        uint8_t type_right, const uint8_t right[10])
+{
+    if (!ctx) return;
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_triggers(c, type_left, left, type_right, right);
+    pthread_mutex_lock(&ctx->out_mutex);
+    if (!ctx->trig_valid || memcmp(ctx->trig_last, &c[DS5_TRIGGER_RIGHT], sizeof(ctx->trig_last)) != 0) {
+        memcpy(ctx->trig_last, &c[DS5_TRIGGER_RIGHT], sizeof(ctx->trig_last));
+        ctx->trig_valid = true;
+        ds5_send_locked(ctx, c, OUT_TRIGGERS);
+    }
+    pthread_mutex_unlock(&ctx->out_mutex);
+}
+
+// Release adaptive-trigger resistance. Sent when hidraw opens (clears what a killed
+// earlier run left), when a session ends and on exit; SIGKILL cannot be covered.
+static void ds5_triggers_off(InputContext *ctx)
+{
+    uint8_t c[DS5_COMMON_SIZE] = {0};
+    ds5_set_triggers_off(c);
+    pthread_mutex_lock(&ctx->out_mutex);
+    memcpy(ctx->trig_last, &c[DS5_TRIGGER_RIGHT], sizeof(ctx->trig_last));
+    ctx->trig_valid = true;
+    ds5_send_locked(ctx, c, OUT_TRIGGERS_OFF);
+    pthread_mutex_unlock(&ctx->out_mutex);
+}
+
+bool input_has_dualsense_output(InputContext *ctx)
+{
+    if (!ctx) return false;
+    bool any = false;
+    pthread_mutex_lock(&ctx->out_mutex);
+    for (int i = 0; i < ctx->num_pads; i++) any |= ctx->pads[i].hid_fd >= 0;
+    pthread_mutex_unlock(&ctx->out_mutex);
+    return any;
+}
+
+void input_haptics_frame(InputContext *ctx, const uint8_t *buf, size_t size)
+{
+    if (!ctx) return;
+    uint16_t s = haptics_strength(buf, size);
+    pthread_mutex_lock(&ctx->state_mutex);
+    if (ctx->hap_frames_total++ == 0)
+        app_log("[INPUT] First haptics frame: %zu bytes, strength %u\n", size, s);
+    if (s > ctx->hap_peak) ctx->hap_peak = s;
+    get_monotonic(&ctx->hap_last);
+    ctx->hap_sum += s;
+    if (++ctx->hap_frames < HAPTICS_FRAMES_PER_RUMBLE) { pthread_mutex_unlock(&ctx->state_mutex); return; }
+    uint8_t level = (uint8_t)((ctx->hap_sum / HAPTICS_FRAMES_PER_RUMBLE) >> 8);
+    ctx->hap_sum = 0;
+    ctx->hap_frames = 0;
+    if (level != ctx->hap_sent) {
+        ctx->hap_sent = level;
+        for (int i = 0; i < ctx->num_pads; i++)
+            if (ctx->pads[i].kind == DEV_PAD) pad_rumble(ctx, &ctx->pads[i], level, level);
+    }
+    pthread_mutex_unlock(&ctx->state_mutex);
+}
+
+// Reader tick: haptics frames stopped while the motors run -> stop them.
+static void haptics_idle_check(InputContext *ctx)
+{
+    pthread_mutex_lock(&ctx->state_mutex);
+    if (ctx->hap_sent && ms_elapsed(&ctx->hap_last) >= HAPTICS_IDLE_STOP_MS) {
+        ctx->hap_sent = 0;
+        ctx->hap_sum = 0;
+        ctx->hap_frames = 0;
+        for (int i = 0; i < ctx->num_pads; i++)
+            if (ctx->pads[i].kind == DEV_PAD) pad_rumble(ctx, &ctx->pads[i], 0, 0);
+    }
+    pthread_mutex_unlock(&ctx->state_mutex);
 }
 
 void input_set_session(InputContext *ctx, ChiakiSession *session)
 {
     if (!ctx) return;
     if (!session) {
+        input_set_rumble(ctx, 0, 0);
+        pthread_mutex_lock(&ctx->state_mutex);
+        if (ctx->hap_frames_total)
+            app_log("[INPUT] Haptics this session: %u frames, peak strength %u (motor level %u)\n",
+                    ctx->hap_frames_total, ctx->hap_peak, ctx->hap_peak >> 8);
+        ctx->hap_sent = 0; ctx->hap_sum = 0; ctx->hap_frames = 0;
+        ctx->hap_frames_total = 0; ctx->hap_peak = 0;
+        pthread_mutex_unlock(&ctx->state_mutex);
+        ds5_triggers_off(ctx);
         // Session over: no contact may stay down into the next session.
         pthread_mutex_lock(&ctx->state_mutex);
         for (int i = 0; i < ctx->num_pads; i++)
@@ -851,13 +1179,17 @@ void input_fini(InputContext *ctx)
     if (!ctx) return;
     ctx->running = false;
     pthread_join(ctx->reader_thread, NULL);
+    input_set_rumble(ctx, 0, 0);
+    ds5_triggers_off(ctx);
     for (int i = 0; i < ctx->num_pads; i++) {
         if (ctx->pads[i].fd >= 0) {
             ioctl(ctx->pads[i].fd, EVIOCGRAB, 0);
             close(ctx->pads[i].fd);
         }
+        if (ctx->pads[i].hid_fd >= 0) close(ctx->pads[i].hid_fd);
     }
     pthread_mutex_destroy(&ctx->state_mutex);
+    pthread_mutex_destroy(&ctx->out_mutex);
     free(ctx);
 }
 

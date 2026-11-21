@@ -53,6 +53,7 @@ static int config_write_defaults(const char *path)
         "  \"auto_connect\": true,\n"
         "  \"auto_connect_delay_ms\": 5000,\n"
         "  \"hevc_rps_keep\": 4,\n"
+        "  \"enable_dualsense\": false,\n"
         "  \"log_level\": \"warning\",\n"
         "  \"psn_refresh_token\": \"\"\n"
         "}\n");
@@ -102,6 +103,7 @@ int config_load(AppConfig *cfg, const char *path)
     cfg->auto_connect_delay_ms = json_get_int(root, "auto_connect_delay_ms", 5000);
     if (cfg->auto_connect_delay_ms < 0)     cfg->auto_connect_delay_ms = 0;
     if (cfg->auto_connect_delay_ms > 60000) cfg->auto_connect_delay_ms = 60000;
+    cfg->enable_dualsense = json_get_bool(root, "enable_dualsense", false);
     cfg->hevc_rps_keep    = json_get_int(root,  "hevc_rps_keep",    4);
     if (cfg->hevc_rps_keep < 0)  cfg->hevc_rps_keep = 0;
     if (cfg->hevc_rps_keep > 16) cfg->hevc_rps_keep = 16;
@@ -154,14 +156,14 @@ int config_load(AppConfig *cfg, const char *path)
     json_object_put(root);
 
     fprintf(stderr, "[CONFIG] Loaded: host=%s ps5=%d %dx%d@%dfps %dkbps "
-            "wakeup=%d psn_wakeup=%s sleep_on_exit=%d auto_connect=%d/%dms hevc_rps_keep=%d log_level=0x%x\n",
+            "wakeup=%d psn_wakeup=%s sleep_on_exit=%d auto_connect=%d/%dms hevc_rps_keep=%d enable_dualsense=%d log_level=0x%x\n",
             cfg->host ? cfg->host : "(null)", cfg->ps5,
             cfg->video_width, cfg->video_height,
             cfg->video_fps, cfg->video_bitrate,
             cfg->wakeup,
             cfg->psn_refresh_token ? "YES" : "NO",
             cfg->sleep_on_exit, cfg->auto_connect, cfg->auto_connect_delay_ms,
-            cfg->hevc_rps_keep,
+            cfg->hevc_rps_keep, cfg->enable_dualsense,
             cfg->log_level);
     return 0;
 }

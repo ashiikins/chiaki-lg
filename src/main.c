@@ -129,6 +129,12 @@ static void log_cb(ChiakiLogLevel level, const char *msg, void *user)
 
 // Set while input is initialised; the session callback runs on a chiaki thread.
 static InputContext *g_input_ctx;
+static void haptics_frame_cb(uint8_t *buf, size_t buf_size, void *user)
+{
+    input_haptics_frame((InputContext *)user, buf, buf_size);
+}
+
+static unsigned g_ds_events_logged;   // one log line per DualSense event type
 
 static void session_event_cb(ChiakiEvent *event, void *user)
 {
@@ -143,6 +149,25 @@ static void session_event_cb(ChiakiEvent *event, void *user)
             (const uint8_t *)"0000", 4);
         break;
     case CHIAKI_EVENT_RUMBLE:
+        input_set_rumble(g_input_ctx, event->rumble.left, event->rumble.right);
+        break;
+    case CHIAKI_EVENT_LED_COLOR:
+        if (!(g_ds_events_logged & 1)) { g_ds_events_logged |= 1;
+            app_log("[APP] First LED colour event: %u,%u,%u\n",
+                    event->led_state[0], event->led_state[1], event->led_state[2]); }
+        input_set_lightbar(g_input_ctx, event->led_state[0], event->led_state[1], event->led_state[2]);
+        break;
+    case CHIAKI_EVENT_PLAYER_INDEX:
+        if (!(g_ds_events_logged & 2)) { g_ds_events_logged |= 2;
+            app_log("[APP] First player index event: %u\n", event->player_index); }
+        input_set_player_index(g_input_ctx, event->player_index);
+        break;
+    case CHIAKI_EVENT_TRIGGER_EFFECTS:
+        if (!(g_ds_events_logged & 4)) { g_ds_events_logged |= 4;
+            app_log("[APP] First trigger effect event: left type 0x%02x, right type 0x%02x\n",
+                    event->trigger_effects.type_left, event->trigger_effects.type_right); }
+        input_set_triggers(g_input_ctx, event->trigger_effects.type_left, event->trigger_effects.left,
+                           event->trigger_effects.type_right, event->trigger_effects.right);
         break;
     case CHIAKI_EVENT_MOTION_RESET:
         app_log("[APP] Motion reset requested by PS5\n");
@@ -1290,6 +1315,12 @@ int main(int argc, char *argv[])
 
     info.video_profile.codec = requested_codec;
 
+    // DualSense mode only with a DualSense whose output reports work: the PS5 then sends
+    // haptics as audio (turned into rumble) instead of rumble events.
+    info.enable_dualsense = cfg.enable_dualsense && input_has_dualsense_output(input_ctx);
+    app_log("[APP] DualSense mode: %s\n", info.enable_dualsense ? "on" :
+            cfg.enable_dualsense ? "off (no DualSense with Bluetooth output)" : "off (config)");
+
     // ── Session / reconnect loop ──────────────────────────────────────────────
     // We stay inside this loop until the user deliberately exits (Home button,
     // SIGTERM) or the PS5 requests a clean disconnect.  On network errors we
@@ -1430,6 +1461,11 @@ int main(int argc, char *argv[])
         chiaki_session_set_video_sample_cb(&g_session,
             video_sample_cb, video_ctx);
         app_log("[APP] Video callback registered\n");
+
+        if (info.enable_dualsense) {
+            ChiakiAudioSink haptics_sink = { .user = input_ctx, .header_cb = NULL, .frame_cb = haptics_frame_cb };
+            chiaki_session_set_haptics_sink(&g_session, &haptics_sink);
+        }
 
         ChiakiAudioSink audio_sink = audio_make_sink(audio_ctx);
         chiaki_session_set_audio_sink(&g_session, &audio_sink);
