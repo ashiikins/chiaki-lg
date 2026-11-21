@@ -143,6 +143,7 @@ static void session_event_cb(ChiakiEvent *event, void *user)
             (const uint8_t *)"0000", 4);
         break;
     case CHIAKI_EVENT_RUMBLE:
+        input_set_rumble(g_input_ctx, event->rumble.left, event->rumble.right);
         break;
     case CHIAKI_EVENT_MOTION_RESET:
         app_log("[APP] Motion reset requested by PS5\n");

@@ -117,6 +117,8 @@ typedef struct {
     char uniq[32];      // shared by a pad's main, Touchpad and Motion Sensors nodes
     TouchSlot slots[TOUCH_SLOTS];
     int  cur_slot;
+    int      ff_id;          // uploaded FF_RUMBLE effect id, -1 = none
+    bool     ff_rumble;      // Sony pad opened read-write with FF_RUMBLE support
     int      motion_res[6];  // Motion Sensors: units per g (ABS_X..Z), per deg/s (ABS_RX..RZ)
     int      motion_raw[6];
     uint32_t motion_ts;      // MSC_TIMESTAMP, microseconds
@@ -538,13 +540,16 @@ static void *evdev_reader(void *arg)
             if (ctx->pads[i].fd < 0) continue;
             if (!FD_ISSET(ctx->pads[i].fd, &rfds)) continue;
 
-            struct input_event ev;
-            ssize_t n = read(ctx->pads[i].fd, &ev, sizeof(ev));
+            struct input_event evs[32];
+            ssize_t n = read(ctx->pads[i].fd, evs, sizeof(evs));
             if (n < 0) {
                 if (errno == EAGAIN || errno == EINTR) continue;
                 app_log("[INPUT] Gamepad %s disconnected\n", ctx->pads[i].path);
+                pthread_mutex_lock(&ctx->state_mutex);   // rumble writes use the fd
                 close(ctx->pads[i].fd);
                 ctx->pads[i].fd = -1;
+                ctx->pads[i].ff_rumble = false;
+                pthread_mutex_unlock(&ctx->state_mutex);
                 if (ctx->pads[i].kind == DEV_MOTION) {
                     pthread_mutex_lock(&ctx->state_mutex);
                     motion_init(&ctx->motion);
@@ -562,34 +567,35 @@ static void *evdev_reader(void *arg)
                 }
                 continue;
             }
-            if (n != sizeof(ev)) continue;
-
-            bool changed = false;
-            pthread_mutex_lock(&ctx->state_mutex);
-
-            if (ctx->pads[i].kind == DEV_TOUCH)
-                changed = apply_touch_event(&ctx->state, &ctx->pads[i], ev.type, ev.code, ev.value);
-            else if (ctx->pads[i].kind == DEV_MOTION)
-                changed = apply_motion_event(&ctx->state, &ctx->pads[i], &ctx->motion, ev.type, ev.code, ev.value);
-            else if (ev.type == EV_KEY) { changed = apply_key_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); }
-            else if (ev.type == EV_ABS) { apply_abs_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); changed = true; }
-
-            ChiakiControllerState snap = ctx->state;
-            pthread_mutex_unlock(&ctx->state_mutex);
-
-            if (changed && ctx->session)
-                chiaki_session_set_controller_state(ctx->session, &snap);
-
-            // Handle deferred tap release: button was tapped+released while
-            // still pending — we sent the press above, now immediately release.
-            if (ctx->pads[i].chord.tap_pending) {
+            for (ssize_t k = 0; k + (ssize_t)sizeof(struct input_event) <= n; k += sizeof(struct input_event)) {
+                struct input_event ev = evs[k / sizeof(struct input_event)];
+                bool changed = false;
                 pthread_mutex_lock(&ctx->state_mutex);
-                ctx->state.buttons &= ~ctx->pads[i].chord.tap_pending;
-                ctx->pads[i].chord.tap_pending = 0;
-                ChiakiControllerState snap2 = ctx->state;
+
+                if (ctx->pads[i].kind == DEV_TOUCH)
+                    changed = apply_touch_event(&ctx->state, &ctx->pads[i], ev.type, ev.code, ev.value);
+                else if (ctx->pads[i].kind == DEV_MOTION)
+                    changed = apply_motion_event(&ctx->state, &ctx->pads[i], &ctx->motion, ev.type, ev.code, ev.value);
+                else if (ev.type == EV_KEY) { changed = apply_key_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); }
+                else if (ev.type == EV_ABS) { apply_abs_event(&ctx->state, &ctx->pads[i], ev.code, ev.value); changed = true; }
+
+                ChiakiControllerState snap = ctx->state;
                 pthread_mutex_unlock(&ctx->state_mutex);
-                if (ctx->session)
-                    chiaki_session_set_controller_state(ctx->session, &snap2);
+
+                if (changed && ctx->session)
+                    chiaki_session_set_controller_state(ctx->session, &snap);
+
+                // Handle deferred tap release: button was tapped+released while
+                // still pending — we sent the press above, now immediately release.
+                if (ctx->pads[i].chord.tap_pending) {
+                    pthread_mutex_lock(&ctx->state_mutex);
+                    ctx->state.buttons &= ~ctx->pads[i].chord.tap_pending;
+                    ctx->pads[i].chord.tap_pending = 0;
+                    ChiakiControllerState snap2 = ctx->state;
+                    pthread_mutex_unlock(&ctx->state_mutex);
+                    if (ctx->session)
+                        chiaki_session_set_controller_state(ctx->session, &snap2);
+                }
             }
         }
     }
@@ -792,6 +798,28 @@ static void open_gamepads(InputContext *ctx)
                 id.vendor, id.product, pad->sony_buttons ? "sony" : "xpad",
                 pad->z_triggers ? "ABS_Z/RZ" : "ABS_GAS/BRAKE");
 
+        pad->ff_id = -1;
+        if (pad->sony_buttons) {
+            // Rumble effects need a read-write fd: reopen and move the grab to it.
+            uint8_t ffbits[(FF_MAX + 7) / 8] = {0};
+            ioctl(fd, EVIOCGBIT(EV_FF, sizeof(ffbits)), ffbits);
+            bool rw = false;
+            if (EVDEV_BITS_TEST(ffbits, FF_RUMBLE)) {
+                int rwfd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+                if (rwfd >= 0) {
+                    ioctl(fd, EVIOCGRAB, 0);
+                    close(fd);
+                    fd = rwfd;
+                    rw = true;
+                    if (ioctl(fd, EVIOCGRAB, 1) < 0)
+                        app_log("[INPUT] EVIOCGRAB FAILED on read-write reopen of %s: %s\n", path, strerror(errno));
+                }
+            }
+            pad->ff_rumble = rw;
+            app_log("[INPUT] Rumble on \"%s\": %s\n", devname,
+                    rw ? "FF_RUMBLE" : EVDEV_BITS_TEST(ffbits, FF_RUMBLE) ? "no write access" : "not supported");
+        }
+
         snprintf(pad->path, sizeof(pad->path), "%s", path);
         pad->kind = DEV_PAD;
         ioctl(fd, EVIOCGUNIQ(sizeof(pad->uniq) - 1), pad->uniq);
@@ -832,10 +860,53 @@ InputContext *input_init(void)
     return ctx;
 }
 
+// ── Rumble (FF_RUMBLE on the Sony pad's main evdev node) ──────────────────────
+// PS5 values are 0-255: left = strong/low-frequency motor, right = weak/high-frequency.
+static uint16_t rumble_magnitude(uint8_t v) { return (uint16_t)(v * 257u); }
+
+// Caller holds state_mutex (the reader closes fds under it).
+static void pad_rumble(GamepadDev *d, uint8_t left, uint8_t right)
+{
+    if (d->fd < 0 || !d->ff_rumble) return;
+    if (!left && !right) {
+        if (d->ff_id >= 0) {
+            struct input_event stop = { .type = EV_FF, .code = (uint16_t)d->ff_id, .value = 0 };
+            (void)!write(d->fd, &stop, sizeof(stop));
+        }
+        return;
+    }
+    struct ff_effect e;
+    memset(&e, 0, sizeof(e));
+    e.type = FF_RUMBLE;
+    e.id = (int16_t)d->ff_id;
+    e.u.rumble.strong_magnitude = rumble_magnitude(left);
+    e.u.rumble.weak_magnitude = rumble_magnitude(right);
+    e.replay.length = 5000;   // safety stop if no further update arrives (as chiaki-ng's SDL path)
+    if (ioctl(d->fd, EVIOCSFF, &e) < 0) {
+        app_log("[INPUT] Rumble upload failed on %s: %s; rumble off\n", d->path, strerror(errno));
+        d->ff_rumble = false;
+        return;
+    }
+    d->ff_id = e.id;
+    struct input_event play = { .type = EV_FF, .code = (uint16_t)e.id, .value = 1 };
+    (void)!write(d->fd, &play, sizeof(play));
+}
+
+void input_set_rumble(InputContext *ctx, uint8_t left, uint8_t right)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->state_mutex);
+    for (int i = 0; i < ctx->num_pads; i++)
+        if (ctx->pads[i].kind == DEV_PAD)
+            pad_rumble(&ctx->pads[i], left, right);
+    pthread_mutex_unlock(&ctx->state_mutex);
+}
+
 void input_set_session(InputContext *ctx, ChiakiSession *session)
 {
     if (!ctx) return;
     if (!session) {
+        input_set_rumble(ctx, 0, 0);
         // Session over: no contact may stay down into the next session.
         pthread_mutex_lock(&ctx->state_mutex);
         for (int i = 0; i < ctx->num_pads; i++)
@@ -851,6 +922,7 @@ void input_fini(InputContext *ctx)
     if (!ctx) return;
     ctx->running = false;
     pthread_join(ctx->reader_thread, NULL);
+    input_set_rumble(ctx, 0, 0);
     for (int i = 0; i < ctx->num_pads; i++) {
         if (ctx->pads[i].fd >= 0) {
             ioctl(ctx->pads[i].fd, EVIOCGRAB, 0);

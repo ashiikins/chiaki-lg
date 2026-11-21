@@ -14,6 +14,9 @@ void          input_fini(InputContext *ctx);
 // Call this after chiaki_session_start() succeeds.
 void input_set_session(InputContext *ctx, ChiakiSession *session);
 
+// CHIAKI_EVENT_RUMBLE: left = strong motor, right = weak motor, 0-255. 0,0 stops.
+void input_set_rumble(InputContext *ctx, uint8_t left, uint8_t right);
+
 // CHIAKI_EVENT_MOTION_RESET: make the current controller pose the new zero.
 void input_motion_reset(InputContext *ctx);
 
