@@ -47,6 +47,20 @@ void ds5_set_triggers_off(uint8_t common[DS5_COMMON_SIZE])
     ds5_set_triggers(common, DS5_TRIGGER_MODE_OFF, zero, DS5_TRIGGER_MODE_OFF, zero);
 }
 
+void ds5_set_rumble(uint8_t common[DS5_COMMON_SIZE], uint8_t left, uint8_t right, bool enhanced)
+{
+    common[DS5_FLAG0] |= DS5_FLAG0_HAPTICS_SELECT;
+    if (enhanced) {
+        common[DS5_FLAG2] |= DS5_FLAG2_COMPAT_VIBRATION2;
+        common[DS5_MOTOR_LEFT] = left;
+        common[DS5_MOTOR_RIGHT] = right;
+    } else {
+        common[DS5_FLAG0] |= DS5_FLAG0_COMPAT_VIBRATION;
+        common[DS5_MOTOR_LEFT] = left >> 1;
+        common[DS5_MOTOR_RIGHT] = right >> 1;
+    }
+}
+
 void ds5_bt_report(uint8_t out[DS5_BT_REPORT_SIZE], uint8_t seq, const uint8_t common[DS5_COMMON_SIZE])
 {
     memset(out, 0, DS5_BT_REPORT_SIZE);

@@ -18,6 +18,9 @@
 
 /* Offsets in the common block (SDL DS5EffectsState_t). */
 #define DS5_FLAG0            0
+#define DS5_MOTOR_RIGHT      2
+#define DS5_MOTOR_LEFT       3
+#define DS5_FLAG2            38
 #define DS5_FLAG1            1
 #define DS5_TRIGGER_RIGHT    10   /* 11 bytes: mode + 10 parameters */
 #define DS5_TRIGGER_LEFT     21
@@ -27,6 +30,9 @@
 
 #define DS5_FLAG0_TRIGGER_RIGHT 0x04
 #define DS5_FLAG0_TRIGGER_LEFT  0x08
+#define DS5_FLAG0_COMPAT_VIBRATION 0x01
+#define DS5_FLAG0_HAPTICS_SELECT   0x02
+#define DS5_FLAG2_COMPAT_VIBRATION2 0x04   /* firmware 2.24 and newer */
 #define DS5_FLAG1_LIGHTBAR      0x04
 #define DS5_FLAG1_PAD_LIGHTS    0x10
 
@@ -42,6 +48,10 @@ void ds5_set_triggers(uint8_t common[DS5_COMMON_SIZE],
                       uint8_t type_left, const uint8_t left[10],
                       uint8_t type_right, const uint8_t right[10]);
 void ds5_set_triggers_off(uint8_t common[DS5_COMMON_SIZE]);
+/* Rumble as SDL and chiaki-ng send it: left = strong motor, right = weak motor.
+ * enhanced = firmware 2.24+ (or unknown over Bluetooth): full values with flag2 bit 2;
+ * older firmware: flag0 bit 0 with values halved. Audio haptics are switched off. */
+void ds5_set_rumble(uint8_t common[DS5_COMMON_SIZE], uint8_t left, uint8_t right, bool enhanced);
 
 /* Wrap a common block in a Bluetooth report with sequence number and CRC. */
 void ds5_bt_report(uint8_t out[DS5_BT_REPORT_SIZE], uint8_t seq, const uint8_t common[DS5_COMMON_SIZE]);
