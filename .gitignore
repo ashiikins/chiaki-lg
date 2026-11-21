@@ -6,3 +6,4 @@ third-party/
 *.a
 *.log
 /tmp/
+tests/build/
