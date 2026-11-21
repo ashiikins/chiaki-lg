@@ -22,20 +22,29 @@ extern volatile bool g_have_video_frame;
 #endif
 #endif
 
-/* NAL IDR detection removed — chiaki provides is_keyframe directly via callback. */
-
 /* ------------------------------------------------------------------------- */
 
 struct VideoContext {
     SS4S_Player *player;
-    int          requested_codec; // CHIAKI_CODEC_* requested in session init
-    int          effective_codec; // CHIAKI_CODEC_* used for UI/stats (may be updated if chiaki reports a sane value)
+    int          codec;         // CHIAKI_CODEC_* negotiated in session init
     bool         use_h265;      // true for H.265 or H.265 HDR sessions
     bool         opened;
     uint64_t     frame_count;
-    unsigned     reported_samples;
-    unsigned     reported_mask;   // bitmask of distinct reported codec values (only for known CHIAKI_CODEC_* values)
+    unsigned     loss_events;
 };
+
+/* True if the Annex-B access unit contains an IDR (H.264) or IRAP (H.265) NAL. */
+static bool au_is_keyframe(const uint8_t *b, size_t n, bool h265)
+{
+    for (size_t i = 0; i + 3 < n; i++) {
+        if (b[i] != 0 || b[i + 1] != 0 || b[i + 2] != 1) continue;
+        uint8_t h = b[i + 3];
+        if (h265 ? (((h >> 1) & 0x3f) >= 16 && ((h >> 1) & 0x3f) <= 21) : ((h & 0x1f) == 5))
+            return true;
+        i += 2;
+    }
+    return false;
+}
 
 VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, int chiaki_codec)
 {
@@ -43,8 +52,7 @@ VideoContext *video_init(SS4S_Player *player, int width, int height, int fps, in
     if (!ctx) return NULL;
 
     ctx->player = player;
-    ctx->requested_codec = chiaki_codec;
-    ctx->effective_codec = chiaki_codec;
+    ctx->codec = chiaki_codec;
     ctx->use_h265 = (chiaki_codec == CHIAKI_CODEC_H265 || chiaki_codec == CHIAKI_CODEC_H265_HDR);
 
     // Stats overlay format hint (also updated from callback codec)
@@ -80,66 +88,24 @@ void video_fini(VideoContext *ctx)
     free(ctx);
 }
 
-/* Actual ChiakiVideoSampleCallback signature (confirmed from build error):
- *   bool (uint8_t *buf, unsigned int buf_size, int codec, bool is_keyframe, void *user)
- * chiaki provides codec type and keyframe flag directly, so no NAL parsing needed.
- * Must return true on success; chiaki logs a warning if we return false. */
-bool video_sample_cb(uint8_t *buf, unsigned int buf_size, int codec, bool is_keyframe, void *user)
+/* ChiakiVideoSampleCallback: (buf, size, frames_lost, frame_recovered, user).
+ * Return false if the frame was not consumed; chiaki-ng then does not use it as a reference. */
+bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
 {
-    /* codec is provided by Chiaki per-sample; useful to confirm negotiation (H264/H265/H265_HDR). */
-
     VideoContext *ctx = (VideoContext *)user;
 
     if (!ctx || !ctx->opened)
         return false;
 
-    // Some Chiaki builds/platforms have been observed to pass a "codec" value that doesn't
-    // match CHIAKI_CODEC_* for the active stream (e.g. 0/1 behaving like a boolean, where
-    // 0 == CHIAKI_CODEC_H264 even for H.265 sessions).
-    // Rule: never allow the callback to "downgrade" a session that was negotiated as HEVC
-    // (H.265 or H.265 HDR) to H.264. The negotiated codec (requested_codec) is the ground
-    // truth; callback values are only trusted when they agree with or upgrade the expectation.
-    const bool codec_known = (codec == CHIAKI_CODEC_H264 || codec == CHIAKI_CODEC_H265 || codec == CHIAKI_CODEC_H265_HDR);
-    if(codec_known)
-    {
-        ctx->reported_samples++;
-        if(codec >= 0 && codec <= 31)
-            ctx->reported_mask |= (1u << (unsigned)codec);
+    if ((frames_lost > 0 || frame_recovered) && ctx->loss_events++ < 20)
+        app_log("[VIDEO] frames_lost=%d recovered=%d\n", (int)frames_lost, frame_recovered ? 1 : 0);
 
-        // Log the first few frames so the negotiated vs reported codec is clearly visible
-        // in /tmp/chiaki.log — useful for diagnosing overlay codec mismatches.
-        if(ctx->reported_samples <= 3)
-            app_log("[VIDEO] sample #%u: negotiated=%d reported=%d keyframe=%d\n",
-                    ctx->reported_samples,
-                    ctx->requested_codec, codec, is_keyframe ? 1 : 0);
-
-        const bool session_is_hevc = (ctx->requested_codec == CHIAKI_CODEC_H265 ||
-                                      ctx->requested_codec == CHIAKI_CODEC_H265_HDR);
-        const bool callback_says_h264 = (codec == CHIAKI_CODEC_H264);
-
-        if(session_is_hevc && callback_says_h264)
-        {
-            // Callback is reporting H.264 for an HEVC-negotiated session — this is the
-            // "codec behaves as boolean" bug in some chiaki-ng builds. Ignore it.
-            if(ctx->reported_samples == 1)
-                app_log("[VIDEO] ignoring spurious H.264 codec report for %s session "
-                        "(negotiated=%d callback=%d)\n",
-                        ctx->requested_codec == CHIAKI_CODEC_H265_HDR ? "H.265 HDR" : "H.265",
-                        ctx->requested_codec, codec);
-        }
-        else if(codec != ctx->effective_codec)
-        {
-            app_log("[VIDEO] codec updated: negotiated=%d effective=%d -> reported=%d\n",
-                    ctx->requested_codec, ctx->effective_codec, codec);
-            ctx->effective_codec = codec;
-        }
-    }
+    const bool is_keyframe = au_is_keyframe(buf, buf_size, ctx->use_h265);
 
     // Update stats counters (callback thread)
     atomic_fetch_add_explicit(&g_stream_stats.video_bytes, (uint64_t)buf_size, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_stream_stats.video_frames, 1, memory_order_relaxed);
-    // Store what we believe is the real effective codec for the overlay.
-    atomic_store_explicit(&g_stream_stats.video_codec, ctx->effective_codec, memory_order_relaxed);
+    atomic_store_explicit(&g_stream_stats.video_codec, ctx->codec, memory_order_relaxed);
 
     SS4S_VideoFeedFlags flags =
         SS4S_VIDEO_FEED_DATA_FRAME_START |
@@ -152,11 +118,11 @@ bool video_sample_cb(uint8_t *buf, unsigned int buf_size, int codec, bool is_key
 
     ctx->frame_count++;
     if (ctx->frame_count <= 5 || ctx->frame_count % 600 == 0) {
-        app_log("[VIDEO/SS4S] frame=%llu  size=%u  keyframe=%d\n",
-                (unsigned long long)ctx->frame_count, buf_size, is_keyframe);
+        app_log("[VIDEO/SS4S] frame=%llu  size=%zu  keyframe=%d\n",
+                (unsigned long long)ctx->frame_count, buf_size, is_keyframe ? 1 : 0);
     }
 
-    int rc = SS4S_PlayerVideoFeed(ctx->player, buf, (size_t)buf_size, flags);
+    int rc = SS4S_PlayerVideoFeed(ctx->player, buf, buf_size, flags);
     if (rc != SS4S_OK) {
         if (ctx->frame_count <= 5)
             app_log("[VIDEO/SS4S] PlayerVideoFeed FAILED rc=%d\n", rc);
