@@ -708,6 +708,75 @@ static bool evdev_suppressed(InputContext *ctx, const GamepadDev *d)
 // ── Evdev reader thread ────────────────────────────────────────────────────────
 static void haptics_idle_check(InputContext *ctx);
 
+// ── Hotplug: a pad that reconnects (sleep, power cycle, driver rebind) gets new
+// nodes; without this they would stay ungrabbed and reach webOS instead of the PS5.
+static bool path_open(InputContext *ctx, const char *path);
+static bool open_pad(InputContext *ctx, const char *path);
+static void open_companions(InputContext *ctx);
+static void ds5_triggers_off(InputContext *ctx);
+
+static uint32_t input_dir_signature(void)
+{
+    DIR *dir = opendir("/dev/input");
+    if (!dir) return 0;
+    uint32_t h = 2166136261u;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL)
+        for (const char *c = ent->d_name; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+    closedir(dir);
+    return h;
+}
+
+static void hotplug_rescan(InputContext *ctx)
+{
+    static uint32_t last_sig, last_us;
+    uint32_t now = monotonic_us();
+    if ((uint32_t)(now - last_us) < 2000000u) return;
+    last_us = now;
+    uint32_t sig = input_dir_signature();
+    if (sig == last_sig) return;
+    bool first = last_sig == 0;
+    last_sig = sig;
+    if (first) return;   // start-up scan already done
+
+    // Drop entries whose nodes are gone, then open new nodes as at start-up.
+    pthread_mutex_lock(&ctx->state_mutex);
+    pthread_mutex_lock(&ctx->out_mutex);
+    int n = 0;
+    for (int i = 0; i < ctx->num_pads; i++) {
+        GamepadDev *d = &ctx->pads[i];
+        if (d->fd < 0) {
+            if (d->hid_fd >= 0) close(d->hid_fd);
+            continue;
+        }
+        if (n != i) ctx->pads[n] = *d;
+        n++;
+    }
+    int before = ctx->num_pads;
+    ctx->num_pads = n;
+    DIR *dir = opendir("/dev/input");
+    int added = 0;
+    if (dir) {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            if (strncmp(ent->d_name, "event", 5) != 0) continue;
+            char path[64];
+            snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+            if (path_open(ctx, path)) continue;
+            added += open_pad(ctx, path);
+        }
+        closedir(dir);
+    }
+    int pads = ctx->num_pads;
+    open_companions(ctx);
+    added += ctx->num_pads - pads;
+    pthread_mutex_unlock(&ctx->out_mutex);
+    pthread_mutex_unlock(&ctx->state_mutex);
+    if (added || before != n)
+        app_log("[INPUT] Hotplug: %d stale entries dropped, %d nodes opened\n", before - n, added);
+    if (added) ds5_triggers_off(ctx);
+}
+
 static void *evdev_reader(void *arg)
 {
     InputContext *ctx = (InputContext *)arg;
@@ -750,6 +819,7 @@ static void *evdev_reader(void *arg)
 
         haptics_idle_check(ctx);
         hid_ownership_update(ctx);
+        hotplug_rescan(ctx);
         if (sel <= 0) continue;
 
         for (int i = 0; i < ctx->num_pads; i++) {
@@ -921,6 +991,9 @@ static void open_companions(InputContext *ctx)
         }
 
         GamepadDev *d = &ctx->pads[ctx->num_pads];
+        memset(d, 0, sizeof(*d));
+        d->fd = -1;
+        d->hid_fd = -1;
         for (int axis = 0; axis < ABS_CNT; axis++) {
             struct input_absinfo info;
             if (ioctl(fd, EVIOCGABS(axis), &info) == 0) {
@@ -993,6 +1066,7 @@ static int open_ds5_hidraw(const char *uniq, bool *enhanced)
 }
 
 static void ds5_triggers_off(InputContext *ctx);
+static bool open_pad(InputContext *ctx, const char *path);
 
 // ── Open and exclusively grab all physical gamepads ───────────────────────────
 static void open_gamepads(InputContext *ctx)
@@ -1015,19 +1089,41 @@ static void open_gamepads(InputContext *ctx)
     struct dirent *ent;
     while ((ent = readdir(dir)) != NULL && num_main < MAX_GAMEPADS) {
         if (strncmp(ent->d_name, "event", 5) != 0) continue;
-
         char path[64];
         snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+        if (open_pad(ctx, path)) num_main++;
+    }
+    closedir(dir);
 
-        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) continue;
+    open_companions(ctx);
 
-        char devname[256] = {0};
-        ioctl(fd, EVIOCGNAME(sizeof(devname) - 1), devname);
+    if (ctx->num_pads == 0)
+        app_log("[INPUT] No physical gamepads found — TV remote only\n");
+    else {
+        app_log("[INPUT] %d gamepad(s) grabbed exclusively\n", ctx->num_pads);
+        app_log("[INPUT] Touchpad on non-Sony pads: Select+Start chord (%dms window) + BTN_RECORD direct\n",
+                CHORD_WINDOW_MS);
+    }
+}
 
-        if (!is_gamepad(fd, devname)) { close(fd); continue; }
+// Open and grab one main gamepad node (also used by the hotplug rescan).
+static bool open_pad(InputContext *ctx, const char *path)
+{
+    if (ctx->num_pads >= MAX_DEVS) return false;
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return false;
 
+    char devname[256] = {0};
+    ioctl(fd, EVIOCGNAME(sizeof(devname) - 1), devname);
+
+    if (!is_gamepad(fd, devname)) { close(fd); return false; }
+
+    {
         GamepadDev *pad = &ctx->pads[ctx->num_pads];
+        memset(pad, 0, sizeof(*pad));
+        pad->fd = -1;
+        pad->hid_fd = -1;
+        touch_slots_init(pad);
 
         // Read axis ranges for proper normalization
         for (int axis = 0; axis < ABS_CNT; axis++) {
@@ -1108,20 +1204,9 @@ static void open_gamepads(InputContext *ctx)
         }
         pad->fd = fd;
         ctx->num_pads++;
-        num_main++;
         app_log("[INPUT] Opened gamepad: \"%s\" @ %s\n", devname, path);
     }
-    closedir(dir);
-
-    open_companions(ctx);
-
-    if (ctx->num_pads == 0)
-        app_log("[INPUT] No physical gamepads found — TV remote only\n");
-    else {
-        app_log("[INPUT] %d gamepad(s) grabbed exclusively\n", ctx->num_pads);
-        app_log("[INPUT] Touchpad on non-Sony pads: Select+Start chord (%dms window) + BTN_RECORD direct\n",
-                CHORD_WINDOW_MS);
-    }
+    return true;
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────
