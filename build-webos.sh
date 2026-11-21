@@ -210,7 +210,9 @@ build_curl() {
         tar xf "/tmp/curl-$ver.tar.gz" -C /tmp
     fi
     pushd "$src"
-    ./configure \
+    # zlib's sysroot .pc adds -I<sysroot>/usr/include ahead of staging, which made
+    # curl compile against the sysroot's OpenSSL 1.1 headers and link its libssl.so.
+    CPPFLAGS="-I$OUR_STAGING/include ${CPPFLAGS:-}" LDFLAGS="-L$OUR_STAGING/lib ${LDFLAGS:-}" ./configure \
         --host=arm-webos-linux-gnueabi --prefix="$OUR_STAGING" \
         --enable-static --disable-shared \
         --with-openssl="$OUR_STAGING" \
@@ -450,6 +452,14 @@ fi
 # ── Patch chiaki-ng sources for webOS compatibility ──────────────────────────
 echo ""
 echo "=== Patching chiaki-ng sources for webOS ==="
+
+# webOS SDK sysroot glibc 2.12 has no aligned_alloc (C11, glibc 2.16).
+# The 0.1.2 release binary imports memalign@GLIBC_2.4, so use memalign.
+COMMON_C="$CHIAKI_NG_DIR/lib/src/common.c"
+if grep -q 'return aligned_alloc(alignment, size);' "$COMMON_C"; then
+    sed -i 's/return aligned_alloc(alignment, size);/{ extern void *memalign(size_t, size_t); return memalign(alignment, size); }/' "$COMMON_C"
+    echo "-- common.c: patched aligned_alloc -> memalign"
+fi
 
 # pthread_clockjoin_np was added in glibc 2.30.
 # webOS uses an older glibc that only has pthread_timedjoin_np (uses CLOCK_REALTIME).
