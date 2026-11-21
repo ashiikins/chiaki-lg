@@ -721,20 +721,25 @@ static uint32_t input_dir_signature(void)
     if (!dir) return 0;
     uint32_t h = 2166136261u;
     struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL)
+    while ((ent = readdir(dir)) != NULL) {   // names and inodes: re-created nodes keep their names
         for (const char *c = ent->d_name; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+        h = (h ^ (uint32_t)ent->d_ino) * 16777619u;
+    }
     closedir(dir);
     return h;
 }
+
+static uint32_t hotplug_force_until;   // after a disconnect: rescan each second for 10 s
 
 static void hotplug_rescan(InputContext *ctx)
 {
     static uint32_t last_sig, last_us;
     uint32_t now = monotonic_us();
-    if ((uint32_t)(now - last_us) < 2000000u) return;
+    bool forced = hotplug_force_until && (int32_t)(hotplug_force_until - now) > 0;
+    if ((uint32_t)(now - last_us) < (forced ? 1000000u : 2000000u)) return;
     last_us = now;
     uint32_t sig = input_dir_signature();
-    if (sig == last_sig) return;
+    if (sig == last_sig && !forced) return;
     bool first = last_sig == 0;
     last_sig = sig;
     if (first) return;   // start-up scan already done
@@ -774,6 +779,9 @@ static void hotplug_rescan(InputContext *ctx)
     pthread_mutex_unlock(&ctx->state_mutex);
     if (added || before != n)
         app_log("[INPUT] Hotplug: %d stale entries dropped, %d nodes opened\n", before - n, added);
+    bool any_pad = false;
+    for (int i = 0; i < ctx->num_pads; i++) any_pad |= ctx->pads[i].fd >= 0 && ctx->pads[i].sony_buttons;
+    if (forced && any_pad && added) hotplug_force_until = 0;   // pad is back
     if (added) ds5_triggers_off(ctx);
 }
 
@@ -837,6 +845,8 @@ static void *evdev_reader(void *arg)
             if (n < 0) {
                 if (errno == EAGAIN || errno == EINTR) continue;
                 app_log("[INPUT] Gamepad %s disconnected\n", ctx->pads[i].path);
+                hotplug_force_until = monotonic_us() + 10000000u;
+                if (!hotplug_force_until) hotplug_force_until = 1;
                 pthread_mutex_lock(&ctx->state_mutex);   // rumble writes use the fd
                 close(ctx->pads[i].fd);
                 ctx->pads[i].fd = -1;
