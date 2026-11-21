@@ -1,6 +1,7 @@
 #include "input.h"
 #include "ds5_out.h"
 #include "ds5_in.h"
+#include "ds5_haptics.h"
 #include "app_log.h"
 
 #include <stdio.h>
@@ -128,6 +129,7 @@ typedef struct {
     bool     kern_mute_prev; // mic mute bit in the last 0x31 report of any kind (kernel's view)
     bool     mic_fix_due;    // send the unmute write with the next report (after the kernel's write)
     bool     kern_muted;     // estimate of hid-playstation's mic_muted toggle (relearned from status)
+    bool     rumble_mode;    // a rumble report switched the motors to rumble emulation since the last haptics
     uint32_t hid_buttons;    // buttons this pad set from hidraw
     int      ff_id;          // uploaded FF_RUMBLE effect id, -1 = none
     bool     ff_rumble;      // Sony pad opened read-write with FF_RUMBLE support
@@ -182,6 +184,12 @@ struct InputContext {
     bool                  mic_want_led;      // wanted mute LED
     uint32_t              muted_reports;     // state reports with the controller's mic muted
     int                   pad_mic_muted;     // controller status mic-mute bit, -1 unknown
+
+    // True haptics over Bluetooth (report 0x32) for DualSense pads with hidraw.
+    Ds5Haptics           *bt_haptics;
+    uint8_t               hap_counter;
+    uint32_t              hap_level_sum, hap_level_n;   // input byte 65: controller haptic buffer, ms
+    uint32_t              hap_stats_us;
 
     GamepadDev    pads[MAX_DEVS];
     int           num_pads;       // all opened nodes (gamepads and companions)
@@ -627,6 +635,7 @@ static void read_ds5_hidraw(InputContext *ctx, GamepadDev *pad)
         }
         if (kind != DS5_IN_STATE) continue;
         ctx->hid_state_reports++;
+        if (n > 65 && ctx->bt_haptics) { ctx->hap_level_sum += buf[65]; ctx->hap_level_n++; }
         bool mute = ds5_mute_button(&in);
         if (mute && !pad->mute_prev && ctx->mic.mute_button)
             ctx->mic.mute_button(ctx->mic.user);
@@ -1120,7 +1129,13 @@ static void pad_rumble(InputContext *ctx, GamepadDev *d, uint8_t left, uint8_t r
         app_log("[INPUT] First rumble %u/%u on %s via %s\n", left, right, d->path,
                 d->hid_fd >= 0 ? "hidraw report 0x31" : d->ff_rumble ? "FF_RUMBLE" : "nothing");
     }
-    if (d->hid_fd >= 0) { ds5_rumble(ctx, d, left, right); return; }   // DualSense: as SDL/chiaki-ng
+    if (d->hid_fd >= 0) {   // DualSense: as SDL/chiaki-ng
+        // Rumble emulation would switch true haptics off: none while haptics play.
+        if (ctx->bt_haptics && ds5_haptics_recent(ctx->bt_haptics, 250)) return;
+        ds5_rumble(ctx, d, left, right);
+        d->rumble_mode = true;
+        return;
+    }
     if (d->fd < 0 || !d->ff_rumble) return;
     if (!left && !right) {
         if (d->ff_id >= 0) {
@@ -1337,9 +1352,12 @@ void input_haptics_frame(InputContext *ctx, const uint8_t *buf, size_t size)
 {
     if (!ctx) return;
     uint16_t s = haptics_strength(buf, size);
+    if (ctx->bt_haptics)   // 3 kHz stereo s16 to the DualSense pads' own actuators
+        ds5_haptics_push(ctx->bt_haptics, (const int16_t *)buf, size / 4);
     pthread_mutex_lock(&ctx->state_mutex);
     if (ctx->hap_frames_total++ == 0)
-        app_log("[INPUT] First haptics frame: %zu bytes, strength %u\n", size, s);
+        app_log("[INPUT] First haptics frame: %zu bytes, strength %u (%s)\n", size, s,
+                ctx->bt_haptics ? "true haptics on DualSense, rumble on other pads" : "as rumble");
     if (s > ctx->hap_peak) ctx->hap_peak = s;
     get_monotonic(&ctx->hap_last);
     ctx->hap_sum += s;
@@ -1350,9 +1368,67 @@ void input_haptics_frame(InputContext *ctx, const uint8_t *buf, size_t size)
     if (level != ctx->hap_sent) {
         ctx->hap_sent = level;
         for (int i = 0; i < ctx->num_pads; i++)
-            if (ctx->pads[i].kind == DEV_PAD) pad_rumble(ctx, &ctx->pads[i], level, level);
+            if (ctx->pads[i].kind == DEV_PAD && !(ctx->bt_haptics && ctx->pads[i].hid_fd >= 0))
+                pad_rumble(ctx, &ctx->pads[i], level, level);
     }
     pthread_mutex_unlock(&ctx->state_mutex);
+}
+
+// Haptics sender: one report (0x32, two blocks) to every DualSense pad. The 0x11 flags keep
+// the mic streaming while it is on; after rumble emulation the motors are handed back first.
+static bool bt_haptics_send(void *user, const int8_t *samples, size_t len)
+{
+    InputContext *ctx = user;
+    bool silent = true, ok = false;
+    for (size_t i = 0; i < len; i++) silent &= samples[i] == 0;
+    pthread_mutex_lock(&ctx->out_mutex);
+    uint8_t flags = DS5_HAPTICS_FLAGS | (ctx->mic_stream ? DS5_HAPTICS_FLAG_MIC : 0);
+    for (int i = 0; i < ctx->num_pads; i++) {
+        GamepadDev *d = &ctx->pads[i];
+        if (d->hid_fd < 0) continue;
+        if (d->rumble_mode && !silent) {
+            uint8_t c[DS5_COMMON_SIZE] = {0}, r31[DS5_BT_REPORT_SIZE];
+            ds5_set_haptics_mode(c);
+            ds5_bt_report(r31, ctx->out_seq++, c);
+            if (write(d->hid_fd, r31, sizeof(r31)) == (ssize_t)sizeof(r31)) d->rumble_mode = false;
+        }
+        uint8_t rep[DS5_MIC_CONTROL_SIZE];
+        ds5_haptics_report(rep, ctx->out_seq++, flags, 48, ctx->hap_counter, samples, len);
+        ok |= write(d->hid_fd, rep, sizeof(rep)) == (ssize_t)sizeof(rep);
+    }
+    ctx->hap_counter += 2;
+    pthread_mutex_unlock(&ctx->out_mutex);
+    return ok;
+}
+
+// Reader tick: every 5 s while true haptics play, one log line.
+static void haptics_stats_log(InputContext *ctx)
+{
+    if (!ctx->bt_haptics) return;
+    uint32_t t = monotonic_us();
+    if ((uint32_t)(t - ctx->hap_stats_us) < 5000000u) return;
+    ctx->hap_stats_us = t;
+    Ds5HapticsStats s;
+    ds5_haptics_stats(ctx->bt_haptics, &s);
+    if (s.reports || s.zero_reports || s.dropped_frames)
+        app_log("[INPUT] true haptics 5 s: %u reports (%.1f/s), %u zero, %u underruns, %u frames dropped, %u write errors, "
+                "%u resyncs, queue %u frames, controller buffer avg %.0f ms\n",
+                s.reports, s.reports / 5.0, s.zero_reports, s.underruns, s.dropped_frames, s.send_errors,
+                s.late_resyncs, s.queued_frames, ctx->hap_level_n ? (double)ctx->hap_level_sum / ctx->hap_level_n : 0.0);
+    ctx->hap_level_sum = ctx->hap_level_n = 0;
+}
+
+void input_set_bt_haptics(InputContext *ctx, bool on)
+{
+    if (!ctx) return;
+    if (on && !ctx->bt_haptics) {
+        ctx->bt_haptics = ds5_haptics_new(bt_haptics_send, ctx);
+        app_log("[INPUT] True haptics over Bluetooth (report 0x32): %s\n", ctx->bt_haptics ? "on" : "failed, rumble");
+    } else if (!on && ctx->bt_haptics) {
+        Ds5Haptics *h = ctx->bt_haptics;
+        ctx->bt_haptics = NULL;
+        ds5_haptics_free(h);
+    }
 }
 
 // Reader tick: haptics frames stopped while the motors run -> stop them.
@@ -1364,15 +1440,18 @@ static void haptics_idle_check(InputContext *ctx)
         ctx->hap_sum = 0;
         ctx->hap_frames = 0;
         for (int i = 0; i < ctx->num_pads; i++)
-            if (ctx->pads[i].kind == DEV_PAD) pad_rumble(ctx, &ctx->pads[i], 0, 0);
+            if (ctx->pads[i].kind == DEV_PAD && !(ctx->bt_haptics && ctx->pads[i].hid_fd >= 0))
+                pad_rumble(ctx, &ctx->pads[i], 0, 0);
     }
     pthread_mutex_unlock(&ctx->state_mutex);
+    haptics_stats_log(ctx);
 }
 
 void input_set_session(InputContext *ctx, ChiakiSession *session)
 {
     if (!ctx) return;
     if (!session) {
+        if (ctx->bt_haptics) ds5_haptics_stop(ctx->bt_haptics);   // zero reports: actuators still
         if (ctx->mic_stream) input_mic_set_state(ctx, false, false);
         input_set_rumble(ctx, 0, 0);
         pthread_mutex_lock(&ctx->state_mutex);
@@ -1398,6 +1477,7 @@ void input_fini(InputContext *ctx)
     if (!ctx) return;
     ctx->running = false;
     pthread_join(ctx->reader_thread, NULL);
+    input_set_bt_haptics(ctx, false);   // sends the zero tail while the pads are still open
     if (ctx->mic_stream) input_mic_set_state(ctx, false, false);
     input_set_rumble(ctx, 0, 0);
     ds5_triggers_off(ctx);

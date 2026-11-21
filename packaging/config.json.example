@@ -13,6 +13,7 @@
     "auto_connect_delay_ms": 5000,
     "hevc_rps_keep": 4,
     "enable_dualsense": false,
+    "dualsense_haptics": true,
     "dualsense_mic": true,
     "dualsense_mic_unmuted": false,
     "video_width": 1920,

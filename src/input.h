@@ -24,6 +24,10 @@ void input_set_triggers(InputContext *ctx, uint8_t type_left, const uint8_t left
                         uint8_t type_right, const uint8_t right[10]);
 bool input_has_dualsense_output(InputContext *ctx);
 
+// True haptics: the PS5's haptics stream goes to DualSense pads as Bluetooth report 0x32
+// (int8 stereo 3 kHz, paced) instead of being turned into rumble; other pads keep rumble.
+void input_set_bt_haptics(InputContext *ctx, bool on);
+
 // DualSense Bluetooth microphone. The handler is called from the input thread.
 typedef struct {
     void (*opus_frame)(const uint8_t *opus, size_t len, uint8_t seq, void *user);  // 48 kHz mono, 10 ms; seq = frame counter
