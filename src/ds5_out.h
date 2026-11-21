@@ -75,6 +75,25 @@ void ds5_set_mic(uint8_t common[DS5_COMMON_SIZE], bool muted);
 #define DS5_MIC_CONTROL_SIZE 142
 void ds5_mic_control_report(uint8_t out[DS5_MIC_CONTROL_SIZE], uint8_t seq, bool enable);
 
+/*
+ * Bluetooth report 0x32 (142 bytes) carrying haptic audio, as chiaki-ng PR #858:
+ *   [2] 0x91 audio control, length 4: [4] flags, [5] [6] controller buffer, [7] counter
+ *   [8] 0x92 (one 64-byte block) or 0xD2 (two blocks), [9] 64, [10..] int8 stereo
+ *   samples at 3 kHz (32 or 64 frames), zero padded; CRC32 at [138..141].
+ * Flags: bit 0 keeps the controller mic streaming, bit 5 applies the buffer length;
+ * PR #858 sends 0x66.
+ */
+#define DS5_HAPTICS_FLAGS       0x66
+#define DS5_HAPTICS_FLAG_MIC    0x01
+#define DS5_HAPTICS_BLOCK       64     /* bytes = 32 stereo frames = 10.67 ms */
+void ds5_haptics_report(uint8_t out[DS5_MIC_CONTROL_SIZE], uint8_t seq, uint8_t flags, uint8_t ctrl_buffer,
+                        uint8_t counter, const int8_t *samples, size_t len);
+
+/* Common block that hands the motors back to audio haptics after rumble emulation
+ * (rumble valid with motors at zero, haptics select cleared), as chiaki-ng-swift's
+ * SDL patch does before its waveform mode. */
+void ds5_set_haptics_mode(uint8_t common[DS5_COMMON_SIZE]);
+
 /* Wrap a common block in a Bluetooth report with sequence number and CRC. */
 void ds5_bt_report(uint8_t out[DS5_BT_REPORT_SIZE], uint8_t seq, const uint8_t common[DS5_COMMON_SIZE]);
 
