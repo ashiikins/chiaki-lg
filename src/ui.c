@@ -11,6 +11,7 @@
 
 #include "config_import.h"
 #include "app_log.h"
+#include <chiaki/log.h>
 
 /* ── Layout ──────────────────────────────────────────────────────────────────
  * Two-panel layout:
@@ -778,23 +779,22 @@ static const char *LOG_LEVEL_LABELS[] = {"Off","Error","Warning","Info","Verbose
 static const char *ui_log_level_to_string(int mask)
 {
     if (mask == 0) return "off";
-    if (mask == 16) return "error";
-    if ((mask & (16|8|4|2|1)) == (16|8|4|2|1)) return "debug";
-    if ((mask & (16|8|4|2))   == (16|8|4|2))   return "verbose";
-    if ((mask & (16|8|4))     == (16|8|4))     return "info";
-    if ((mask & (16|8))       == (16|8))       return "warning";
-    return "warning";
+    if (mask & CHIAKI_LOG_DEBUG)   return "debug";
+    if (mask & CHIAKI_LOG_VERBOSE) return "verbose";
+    if (mask & CHIAKI_LOG_INFO)    return "info";
+    if (mask & CHIAKI_LOG_WARNING) return "warning";
+    return "error";
 }
 
 static int ui_log_level_from_string(const char *s)
 {
     if (!s || !s[0] || !strcmp(s,"off"))     return 0;
-    if (!strcmp(s,"error"))                  return 16;
-    if (!strcmp(s,"warning"))                return 16|8;
-    if (!strcmp(s,"info"))                   return 16|8|4;
-    if (!strcmp(s,"verbose"))                return 16|8|4|2;
-    if (!strcmp(s,"debug"))                  return 16|8|4|2|1;
-    return 16|8;
+    if (!strcmp(s,"error"))                  return CHIAKI_LOG_ERROR;
+    if (!strcmp(s,"warning"))                return CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING;
+    if (!strcmp(s,"info"))                   return CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING|CHIAKI_LOG_INFO;
+    if (!strcmp(s,"verbose"))                return CHIAKI_LOG_ALL & ~CHIAKI_LOG_DEBUG;
+    if (!strcmp(s,"debug"))                  return CHIAKI_LOG_ALL;
+    return CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING;
 }
 
 static int ui_find_resolution_idx(const AppConfig *cfg)
@@ -831,7 +831,7 @@ static int ui_find_codec_idx(const AppConfig *cfg)
 }
 static int ui_find_log_level_idx(const AppConfig *cfg)
 {
-    const char *s = ui_log_level_to_string(cfg ? cfg->log_level : (16|8));
+    const char *s = ui_log_level_to_string(cfg ? cfg->log_level : (CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING));
     for (int i = 0; i < 6; i++) if (!strcmp(LOG_LEVEL_STRS[i], s)) return i;
     return 2;
 }

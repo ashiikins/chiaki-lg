@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <errno.h>
 
 #include <SDL2/SDL.h>
@@ -64,9 +65,21 @@ volatile bool g_have_video_frame = false;
 
 // Global log file — accessible via app_log() from audio.c / video.c
 FILE *g_log_file   = NULL;
-int   g_log_level  = 0x1c;  // default: INFO|WARNING|ERROR until config loads
+int   g_log_level  = CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING|CHIAKI_LOG_INFO;  // until config loads
 
 // ── Shared log helpers ────────────────────────────────────────────────────────
+
+static FILE *open_private_log(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return NULL;
+    (void)fchmod(fd, 0600);
+    FILE *f = fdopen(fd, "w");
+    if (!f)
+        close(fd);
+    return f;
+}
 
 // app_log_always: unconditional — bypasses log_level gate entirely.
 // Use for wakeup/probe status, session lifecycle, and anything that must
@@ -88,7 +101,7 @@ void app_log_always(const char *fmt, ...)
 // app_log: INFO-gated — for high-volume operational chatter.
 void app_log(const char *fmt, ...)
 {
-    if (!(g_log_level & 0x04)) return;  // INFO bit not set — suppress
+    if (!(g_log_level & CHIAKI_LOG_INFO)) return;
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -1002,9 +1015,10 @@ int main(int argc, char *argv[])
 
     // Open log unconditionally first — once cfg is loaded we'll close it
     // if logging=false. This lets us capture any early startup errors.
-    g_log_file = fopen(LOG_PATH, "w");
+    // The log can hold session details: owner-only, also when an older run left it readable.
+    g_log_file = open_private_log(LOG_PATH);
     if (!g_log_file)
-        g_log_file = fopen("/tmp/chiaki-debug.log", "w");
+        g_log_file = open_private_log("/tmp/chiaki-debug.log");
 
     // Stamp each launch clearly so we can count restarts in the log.
     {

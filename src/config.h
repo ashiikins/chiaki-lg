@@ -28,7 +28,7 @@ typedef struct {
     int      takion_version;    // Remote Play protocol: 0 = try 20, fall back to 12; 12/15/20 = pin
     int      hevc_rps_keep;     // H.265: max short-term refs kept per slice (0 = off)
     char    *ss4s_module;
-    int      log_level;         // chiaki bitmask: DEBUG=1 VERBOSE=2 INFO=4 WARNING=8 ERROR=16
+    int      log_level;         // ChiakiLogLevel bitmask (chiaki/log.h)
     // PSN cloud wakeup — needed when PS5 ignores local UDP wakeup (port 987).
     // Copy from: %APPDATA%\Roaming\Chiaki\Chiaki.conf  →  psn_refresh_token = v3.xxxxx
     char    *psn_refresh_token; // long-lived OAuth2 refresh token (optional)

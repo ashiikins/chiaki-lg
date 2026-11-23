@@ -4,6 +4,7 @@
 #include <string.h>
 #include <json-c/json.h>
 #include <sys/stat.h>
+#include <chiaki/log.h>
 
 static char *json_get_str(struct json_object *obj, const char *key)
 {
@@ -122,22 +123,22 @@ int config_load(AppConfig *cfg, const char *path)
         if (json_object_object_get_ex(root, "log_level", &lv))
         {
             if (json_object_get_type(lv) == json_type_boolean) {
-                cfg->log_level = json_object_get_boolean(lv) ? (8|16) : 0;
+                cfg->log_level = json_object_get_boolean(lv) ? (CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING) : 0;
             } else {
                 const char *s = json_object_get_string(lv);
                 if      (!s || !strcmp(s,"off"))     cfg->log_level = 0;
-                else if (!strcmp(s,"error"))         cfg->log_level = 16;
-                else if (!strcmp(s,"warning"))       cfg->log_level = 16|8;
-                else if (!strcmp(s,"info"))          cfg->log_level = 16|8|4;
-                else if (!strcmp(s,"verbose"))       cfg->log_level = 16|8|4|2;
-                else if (!strcmp(s,"debug"))         cfg->log_level = 16|8|4|2|1;
-                else                                 cfg->log_level = 16|8;
+                else if (!strcmp(s,"error"))         cfg->log_level = CHIAKI_LOG_ERROR;
+                else if (!strcmp(s,"warning"))       cfg->log_level = CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING;
+                else if (!strcmp(s,"info"))          cfg->log_level = CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING|CHIAKI_LOG_INFO;
+                else if (!strcmp(s,"verbose"))       cfg->log_level = CHIAKI_LOG_ALL & ~CHIAKI_LOG_DEBUG;
+                else if (!strcmp(s,"debug"))         cfg->log_level = CHIAKI_LOG_ALL;
+                else                                 cfg->log_level = CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING;
             }
         }
         else if (json_object_object_get_ex(root, "logging", &lv))
-            cfg->log_level = json_object_get_boolean(lv) ? (8|16) : 0;
+            cfg->log_level = json_object_get_boolean(lv) ? (CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING) : 0;
         else
-            cfg->log_level = 16|8;
+            cfg->log_level = CHIAKI_LOG_ERROR|CHIAKI_LOG_WARNING;
     }
 
     cfg->ss4s_module = json_get_str(root, "ss4s_module");
