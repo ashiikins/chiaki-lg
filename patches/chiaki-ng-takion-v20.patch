@@ -510,6 +510,29 @@ index 744d8076..8ec8ecc6 100644
  		audio_receiver->session->haptics_sink.frame_cb(buf, buf_size, audio_receiver->session->haptics_sink.user);
  	else if(!is_haptics && audio_receiver->session->audio_sink.frame_cb)
  		audio_receiver->session->audio_sink.frame_cb(buf, buf_size, audio_receiver->session->audio_sink.user);
+diff --git a/lib/src/ctrl.c b/lib/src/ctrl.c
+index 400c1c4a..a5978703 100644
+--- a/lib/src/ctrl.c
++++ b/lib/src/ctrl.c
+@@ -1234,6 +1234,7 @@ static ChiakiErrorCode ctrl_connect(ChiakiCtrl *ctrl)
+ 			"RP-ConPath: 1\r\n"
+ 			"%s%s%s"
+ 			"%s%s%s"
++			"%s"
+ 			"\r\n";
+ 
+ 	const char *path;
+@@ -1254,7 +1255,9 @@ static ChiakiErrorCode ctrl_connect(ChiakiCtrl *ctrl)
+ 			have_bitrate ? "\r\n" : "",
+ 			have_streaming_type ? "RP-StreamingType: " : "",
+ 			have_streaming_type ? streaming_type_b64 : "",
+-			have_streaming_type ? "\r\n" : "");
++			have_streaming_type ? "\r\n" : "",
++			// as the Windows client; without it a PS5 sends some trigger effects as mode 0x05 (off)
++			chiaki_target_is_ps5(session->target) ? "RP-PadProcNo: 3\r\n" : "");
+ 	if(request_len < 0 || request_len >= sizeof(send_buf))
+ 		goto error;
+ 
 diff --git a/lib/src/ecdh.c b/lib/src/ecdh.c
 index 3277b606..3c84cf93 100644
 --- a/lib/src/ecdh.c
